@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=OpenWrt Flasher
+GenericName=Router Firmware Flasher
+Comment=Flash and recover OpenWrt boards over SSH, serial, TFTP and HTTP
+Exec=openwrt-flasher
+Icon=com.bling.openwrtFlasher
+Terminal=false
+Categories=Network;Utility;
+Keywords=OpenWrt;router;firmware;flash;sysupgrade;TFTP;serial;U-Boot;
+StartupNotify=true
+StartupWMClass=com.bling.openwrtFlasher
