@@ -103,11 +103,14 @@ class _HomeScreenState extends State<HomeScreen> {
   final ScrollController _consoleScrollController = ScrollController();
   StreamSubscription<String>? _serialSub;
   String _recoveryStatus = 'Not connected';
+  bool _recoveryStatusIsError = false;
   String? _openwrtInitramfsPath;
   String? _sysupgradeImagePath;
   bool _downloadingDefault = false;
   String? _initramfsDownloadStatus;
+  bool _initramfsDownloadError = false;
   String? _upgradeDownloadStatus;
+  bool _upgradeDownloadError = false;
   // Each OS's own TFTP server serves a different folder by default.
   late String _tftpDir = switch (_os) {
     HostOs.windows => r'C:\tftp',
@@ -128,6 +131,7 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _selectedIp;
   RouterInfo? _router;
   String _discoveryStatus = 'Not searched yet.';
+  bool _discoveryStatusIsError = false;
   bool _discoveryBusy = false;
 
   String? _firmwarePath;
@@ -239,11 +243,18 @@ class _HomeScreenState extends State<HomeScreen> {
       _showErrorToast('Choose a serial port first.');
       return;
     }
-    _runOnUi(() => _recoveryStatus = 'Connecting...');
+    _runOnUi(() {
+      _recoveryStatus = 'Connecting to $_selectedSerialPort...';
+      _recoveryStatusIsError = false;
+    });
     final success = await _serialService.connect(_selectedSerialPort);
     _runOnUi(() {
       _serialConnected = success;
-      _recoveryStatus = success ? 'Connected to $_selectedSerialPort' : 'Failed to connect';
+      _recoveryStatusIsError = !success;
+      _recoveryStatus = success
+          ? 'Connected to $_selectedSerialPort · 115200 baud'
+          : 'Could not connect to $_selectedSerialPort: '
+              '${_serialService.lastError ?? 'unknown error'}.';
     });
     if (!success) {
       _showErrorToast(
@@ -259,6 +270,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _runOnUi(() {
       _serialConnected = false;
       _recoveryStatus = 'Disconnected';
+      _recoveryStatusIsError = false;
     });
   }
 
@@ -277,10 +289,14 @@ class _HomeScreenState extends State<HomeScreen> {
     final name = _initramfsName;
     final file = File('$_tftpDir${Platform.pathSeparator}$name');
     if (!await file.exists()) {
-      _showErrorToast(
-        '$_tftpDir does not contain $name yet. Download the default firmware in '
-        'step 3 or press Copy Files in step 4 first.',
-      );
+      final message =
+          '$_tftpDir does not contain $name yet. Download the default firmware '
+          'in step 1 or press Copy Files first.';
+      _runOnUi(() {
+        _recoveryStatus = message;
+        _recoveryStatusIsError = true;
+      });
+      _showErrorToast(message);
       return;
     }
     _sendPromptValue(name);
@@ -343,30 +359,39 @@ class _HomeScreenState extends State<HomeScreen> {
         if (image.isUpgrade) {
           _sysupgradeImagePath = file.path;
           _upgradeDownloadStatus = message;
+          _upgradeDownloadError = false;
         } else {
           _openwrtInitramfsPath = file.path;
           _initramfsDownloadStatus = message;
+          _initramfsDownloadError = false;
         }
         _recoveryStatus = message;
+        _recoveryStatusIsError = false;
       });
     } catch (e) {
-      _setDownloadStatus(image, 'Download failed: $e');
+      _setDownloadStatus(image, 'Download failed: $e', error: true);
       _showErrorToast(
         'Could not download the ${image.label} firmware: $e If $directory is '
         'not writable, run the command in step 1 first or pick another folder '
-        'in step 4.',
+        'in step 3.',
       );
     } finally {
       _runOnUi(() => _downloadingDefault = false);
     }
   }
 
-  void _setDownloadStatus(DefaultFirmwareImage image, String message) {
+  void _setDownloadStatus(
+    DefaultFirmwareImage image,
+    String message, {
+    bool error = false,
+  }) {
     _runOnUi(() {
       if (image.isUpgrade) {
         _upgradeDownloadStatus = message;
+        _upgradeDownloadError = error;
       } else {
         _initramfsDownloadStatus = message;
+        _initramfsDownloadError = error;
       }
     });
   }
@@ -388,9 +413,15 @@ class _HomeScreenState extends State<HomeScreen> {
         if (File(path).absolute.path == File(target).absolute.path) continue;
         await File(path).copy(target);
       }
-      _runOnUi(() => _recoveryStatus = 'Files copied to $_tftpDir');
+      _runOnUi(() {
+        _recoveryStatus = 'Files copied to $_tftpDir';
+        _recoveryStatusIsError = false;
+      });
     } catch (e) {
-      _runOnUi(() => _recoveryStatus = 'Error copying files: $e');
+      _runOnUi(() {
+        _recoveryStatus = 'Could not copy the files to $_tftpDir: $e';
+        _recoveryStatusIsError = true;
+      });
       _showErrorToast('Could not copy the files to $_tftpDir: $e');
     }
   }
@@ -404,6 +435,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _httpServerError = false;
         _httpServerMessage = 'HTTP server stopped.';
         _recoveryStatus = 'HTTP server stopped';
+        _recoveryStatusIsError = false;
       });
       return;
     }
@@ -424,8 +456,10 @@ class _HomeScreenState extends State<HomeScreen> {
           : 'Could not start the HTTP server: '
               '${error ?? 'unknown error'}. Make sure the folder exists and '
               'no other program is using the port.';
-      _recoveryStatus =
-          url != null ? 'HTTP server running at $url' : 'Failed to start server';
+      _recoveryStatus = url != null
+          ? 'HTTP server running at $url'
+          : 'Failed to start the HTTP server.';
+      _recoveryStatusIsError = url == null;
     });
     if (url == null) {
       _showErrorToast(
@@ -481,12 +515,30 @@ class _HomeScreenState extends State<HomeScreen> {
   static String _shortHash(String value) =>
       value.length <= 16 ? value : '${value.substring(0, 16)}...';
 
+  /// Dialogs never stretch across a wide window; on small windows the inset
+  /// padding keeps them inside the screen.
+  AlertDialog _dialog({
+    Widget? icon,
+    required Widget title,
+    required Widget content,
+    required List<Widget> actions,
+  }) {
+    return AlertDialog(
+      icon: icon,
+      title: title,
+      content: content,
+      actions: actions,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
+      constraints: const BoxConstraints(minWidth: 280, maxWidth: 540),
+    );
+  }
+
   Future<bool> _approveHostKey(HostKeyOffer offer) async {
     if (!mounted) return false;
     final accepted = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
-      builder: (dialogContext) => AlertDialog(
+      builder: (dialogContext) => _dialog(
         title: Text('Unrecognised host key for ${offer.host}'),
         content: SingleChildScrollView(
           child: Column(
@@ -536,6 +588,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _runOnUi(() {
       _discoveryBusy = true;
       _discoveryStatus = 'Looking for a device on this network...';
+      _discoveryStatusIsError = false;
     });
     String error = '';
     try {
@@ -553,6 +606,8 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     _runOnUi(() {
       _discoveryBusy = false;
+      _discoveryStatus = 'Search failed: $error';
+      _discoveryStatusIsError = true;
     });
     _showErrorToast('Search failed: $error');
   }
@@ -568,6 +623,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _gateway = gateway;
       _discoveryBusy = false;
       _candidates = candidates;
+      _discoveryStatusIsError = candidates.isEmpty || network == null;
       if (candidates.length == 1) _selectedIp = candidates.single.ip;
       if (candidates.isEmpty) {
         _discoveryStatus = warning.isEmpty
@@ -596,13 +652,17 @@ class _HomeScreenState extends State<HomeScreen> {
     if (ip == null) {
       const message = 'No LAN gateway found. Connect the router with an '
           'Ethernet cable and press Search again.';
-      _runOnUi(() => _discoveryStatus = message);
+      _runOnUi(() {
+        _discoveryStatus = message;
+        _discoveryStatusIsError = true;
+      });
       _showErrorToast(message);
       return;
     }
     _runOnUi(() {
       _discoveryBusy = true;
       _discoveryStatus = 'Reading the device identity over SSH at $ip...';
+      _discoveryStatusIsError = false;
       _router = null;
     });
     try {
@@ -617,6 +677,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _versionBefore = identity.firmwareVersion;
         _discoveryStatus = 'Confirmed: ${identity.boardName} at '
             '${identity.ip} running ${identity.firmwareVersion}.';
+        _discoveryStatusIsError = false;
       });
       _invalidateChecks();
       await _revalidateFirmware();
@@ -625,6 +686,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _runOnUi(() {
         _discoveryBusy = false;
         _discoveryStatus = 'Cannot confirm this device: ${error.message}';
+        _discoveryStatusIsError = true;
       });
       _showErrorToast(
         'Could not identify the router at $ip.\n${error.message}',
@@ -635,6 +697,7 @@ class _HomeScreenState extends State<HomeScreen> {
         // The card must not stay busy if something unexpected escapes.
         _discoveryBusy = false;
         _discoveryStatus = 'Cannot confirm this device: $error';
+        _discoveryStatusIsError = true;
       });
       _showErrorToast('Could not identify the router at $ip: $error');
     }
@@ -650,12 +713,13 @@ class _HomeScreenState extends State<HomeScreen> {
     final wasPinned = await _hostKeys.pinnedFingerprint(ip) != null;
     await _hostKeys.unpin(ip);
     await _ssh.disconnect();
-    _runOnUi(
-      () => _discoveryStatus = wasPinned
+    _runOnUi(() {
+      _discoveryStatus = wasPinned
           ? 'Forgot the pinned host key for $ip. Identify the router again to '
               'approve whichever key it presents now.'
-          : 'No host key was pinned for $ip.',
-    );
+          : 'No host key was pinned for $ip.';
+      _discoveryStatusIsError = false;
+    });
     _invalidateChecks();
   }
 
@@ -1164,7 +1228,7 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
+      builder: (context) => _dialog(
         icon: const Icon(Icons.settings_backup_restore),
         title: const Text('Restore this configuration?'),
         content: const Text(
@@ -1410,7 +1474,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget _buildRecoveryTab(ThemeData theme) {
     return LayoutBuilder(
       builder: (context, constraints) {
-        final wide = constraints.maxWidth >= 1100;
+        final wide = constraints.maxWidth >= 1180;
         final guide = ListView(
           padding: const EdgeInsets.all(24),
           children: [
@@ -1420,25 +1484,42 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 8),
             Text(
-              'Boot an OpenWrt board into a temporary OpenWrt environment and permanently '
-              'install the OpenWrt firmware using a ${_os.machine}.',
+              'Boot an OpenWrt board into a temporary OpenWrt environment and '
+              'permanently install the OpenWrt firmware using a ${_os.machine}.',
               style: theme.textTheme.bodyMedium,
             ),
+            const SizedBox(height: 16),
+            _callout(
+              theme,
+              Icons.format_list_numbered,
+              'Follow the steps in order',
+              'Start by unplugging the USB-to-TTL adapter from your '
+                  '${_os.machine} if it is plugged in. Steps 1 and 2 prepare '
+                  'your computer, connect the Ethernet (LAN) cable and wire '
+                  'the board. Power on the router in step 3, then plug the '
+                  'adapter back in and open the serial console in step 4.',
+            ),
             const SizedBox(height: 24),
-            _header(theme, 'Prerequisites'),
+            _stepHeader(theme, 1, 'Prepare your computer'),
             _prerequisitesCard(theme),
             const SizedBox(height: 24),
-            _header(theme, 'Hardware Setup'),
+            _stepHeader(theme, 2, 'Wire the board'),
             _hardwareCard(theme),
             const SizedBox(height: 24),
-            _header(theme, 'Boot OpenWrt (Temporary)'),
-            _bootOpenWrtCard(theme),
+            _stepHeader(theme, 3, 'Power on the router'),
+            _powerOnCard(theme),
+            const SizedBox(height: 24),
+            _stepHeader(theme, 4, 'Plug in USB-to-TTL and open the serial console'),
+            _serialConsoleCard(theme),
             if (!wide) ...[
               const SizedBox(height: 16),
-              _consolePanel(theme, height: 480),
+              _consolePanel(theme, height: 520),
             ],
             const SizedBox(height: 24),
-            _header(theme, 'Install OpenWrt Firmware'),
+            _stepHeader(theme, 5, 'Load OpenWrt into RAM from the bootloader'),
+            _loadImageCard(theme),
+            const SizedBox(height: 24),
+            _stepHeader(theme, 6, 'Install OpenWrt permanently'),
             _installCard(theme),
             const SizedBox(height: 24),
             _header(theme, 'After Installation'),
@@ -1455,7 +1536,7 @@ class _HomeScreenState extends State<HomeScreen> {
           children: [
             Expanded(child: guide),
             SizedBox(
-              width: (constraints.maxWidth * 0.45).clamp(480.0, 1000.0),
+              width: (constraints.maxWidth * 0.58).clamp(640.0, 1400.0),
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(0, 24, 24, 24),
                 child: _consolePanel(theme),
@@ -1468,13 +1549,6 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _prerequisitesCard(ThemeData theme) {
-    final detectedPorts = _guideText(
-      theme,
-      _availablePorts.isEmpty
-          ? 'No serial ports detected yet. Plug in the adapter and press refresh in '
-              '"Open the Serial Console" below.'
-          : 'Detected: ${_availablePorts.join(', ')}',
-    );
     final steps = <Widget>[
       ...switch (_os) {
         HostOs.windows => [
@@ -1485,19 +1559,13 @@ class _HomeScreenState extends State<HomeScreen> {
               const SizedBox(height: 6),
               _guideText(theme,
                   'Install a TFTP server such as Tftpd64, set its base directory to '
-                  'the firmware folder in step 4, and select 192.168.1.2 (your '
-                  'Ethernet adapter, after step 6) as the server interface. The '
-                  'bootloader downloads the initramfs image from it.'),
+                  'the firmware folder below, and select 192.168.1.2 (your '
+                  'Ethernet adapter) as the server interface. The bootloader '
+                  'downloads the initramfs image from it.'),
               _guideCode(theme, 'https://pjo2.github.io/tftpd64/'),
               _guideText(theme,
                   'Nothing else is needed: this app includes the serial console '
                   '(replaces PuTTY) and the temporary HTTP server (replaces Python).'),
-            ]),
-            _guideStep(theme, 2, 'Find the COM Port', [
-              _guideText(theme,
-                  'Plug in the USB to TTL adapter, open Device Manager and expand '
-                  'Ports (COM & LPT). Example: USB-SERIAL CH340 (COM4).'),
-              detectedPorts,
             ]),
           ],
         HostOs.macos => [
@@ -1511,11 +1579,6 @@ class _HomeScreenState extends State<HomeScreen> {
               _guideText(theme, 'Optional: a TFTP client to test the server:'),
               _guideCode(theme, 'brew install tftp-hpa'),
             ]),
-            _guideStep(theme, 2, 'Find the USB to TTL Port', [
-              _guideCode(theme, _listSerialCommand),
-              _guideText(theme, 'Example: $_serialExample'),
-              detectedPorts,
-            ]),
           ],
         HostOs.linux => [
             _guideStep(theme, 1, 'Install the TFTP Server', [
@@ -1526,18 +1589,9 @@ class _HomeScreenState extends State<HomeScreen> {
                   'sudo apt install tftpd-hpa\n'
                   'sudo chown \$USER /srv/tftp'),
             ]),
-            _guideStep(theme, 2, 'Find the USB to TTL Port', [
-              _guideCode(theme, _listSerialCommand),
-              _guideText(theme, 'Example: $_serialExample'),
-              _guideText(theme,
-                  'Opening the port needs the dialout group (uucp on Arch). Log out '
-                  'and back in after running:'),
-              _guideCode(theme, 'sudo usermod -aG dialout \$USER'),
-              detectedPorts,
-            ]),
           ],
       },
-      _guideStep(theme, 3, 'Download Required Firmware', [
+      _guideStep(theme, 2, 'Download Required Firmware', [
         _guideLabel(theme, 'Default Firmware (initramfs)'),
         _guideText(theme,
             'If you have not downloaded firmware yet, use the default. It is '
@@ -1549,7 +1603,11 @@ class _HomeScreenState extends State<HomeScreen> {
           const SizedBox(height: 6),
         ],
         if (_initramfsDownloadStatus != null) ...[
-          _guideText(theme, _initramfsDownloadStatus!),
+          _inlineStatus(
+            theme,
+            _initramfsDownloadStatus!,
+            error: _initramfsDownloadError,
+          ),
           const SizedBox(height: 4),
         ],
         _guideText(theme,
@@ -1579,7 +1637,11 @@ class _HomeScreenState extends State<HomeScreen> {
           const SizedBox(height: 6),
         ],
         if (_upgradeDownloadStatus != null) ...[
-          _guideText(theme, _upgradeDownloadStatus!),
+          _inlineStatus(
+            theme,
+            _upgradeDownloadStatus!,
+            error: _upgradeDownloadError,
+          ),
           const SizedBox(height: 4),
         ],
         _guideCode(theme, _tableOfHardwareLink),
@@ -1592,7 +1654,7 @@ class _HomeScreenState extends State<HomeScreen> {
           _pickSysupgradeImage,
         ),
       ]),
-      _guideStep(theme, 4, _isWindows ? 'Create a Firmware Folder' : 'Copy Firmware Files', [
+      _guideStep(theme, 3, _isWindows ? 'Create a Firmware Folder' : 'Copy Firmware Files', [
         _guideText(theme,
             'Copy all downloaded firmware files to the folder your TFTP server '
             'serves:'),
@@ -1621,12 +1683,12 @@ class _HomeScreenState extends State<HomeScreen> {
           ],
         ),
       ]),
-      _guideStep(theme, 5, 'Connect the Router', [
+      _guideStep(theme, 4, 'Connect Ethernet and Set a Static IP Address', [
         _guideText(theme,
-            'Connect your ${_os.machine} directly to one of the '
-            'LAN ports of the OpenWrt board.'),
-      ]),
-      _guideStep(theme, 6, 'Configure a Static IP Address', [
+            'Connect an Ethernet cable from a LAN port of the router to your '
+            '${_os.machine}. The static IP below is set on that wired adapter, '
+            'so connect the cable first.'),
+        const SizedBox(height: 6),
         _guideText(theme,
             'Use 192.168.1.2: it is the TFTP server address U-Boot uses by default.'),
         const SizedBox(height: 6),
@@ -1673,6 +1735,16 @@ class _HomeScreenState extends State<HomeScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            _callout(
+              theme,
+              Icons.usb_off,
+              'Start with the adapter unplugged',
+              'Unplug the USB-to-TTL adapter from your ${_os.machine} now if it '
+                  'is plugged in. Wire it to the board and power the router '
+                  'before plugging it back in (step 4).',
+              error: true,
+            ),
+            const SizedBox(height: 16),
             Text('Required Hardware', style: theme.textTheme.titleSmall),
             const SizedBox(height: 6),
             _guideBullet(theme, 'USB to TTL Adapter (CH340G, CP2102, FT232, etc.)'),
@@ -1714,6 +1786,16 @@ class _HomeScreenState extends State<HomeScreen> {
             const SizedBox(height: 12),
             _callout(
               theme,
+              Icons.swap_horiz,
+              'Pin labels are not the same on every board',
+              'Some boards are labeled TX → TX and RX → RX, so they connect '
+                  'straight. Other boards need TX → RX and RX → TX (crossed). '
+                  'If the console shows no output, swap the TX and RX wires and '
+                  'try again.',
+            ),
+            const SizedBox(height: 12),
+            _callout(
+              theme,
               Icons.warning_amber_rounded,
               'Important',
               'Do not connect the 3.3V/VCC pin.\n'
@@ -1726,8 +1808,55 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _bootOpenWrtCard(ThemeData theme) {
-    final connectStep = <Widget>[
+  Widget _powerOnCard(ThemeData theme) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _guideText(theme,
+                'Keep the USB-to-TTL adapter unplugged while you do this:'),
+            const SizedBox(height: 6),
+            _guideBullet(theme,
+                'Check that the Ethernet cable from step 1 is still connected.'),
+            _guideBullet(theme, 'Plug in the router\'s original power adapter.'),
+            _guideBullet(theme,
+                'Confirm the power light indicator on the router is ON before '
+                'continuing.'),
+            const SizedBox(height: 10),
+            _callout(
+              theme,
+              Icons.lightbulb_outline,
+              'Power LED must be ON',
+              'If the power light stays off, check the power adapter and the '
+                  'outlet. Do not continue until the router is powered.',
+              error: true,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _serialConsoleCard(ThemeData theme) {
+    final detectedPorts = _guideText(
+      theme,
+      _availablePorts.isEmpty
+          ? 'No serial ports detected yet. Plug in the adapter and press the '
+              'refresh button next to the port list.'
+          : 'Detected: ${_availablePorts.join(', ')}',
+    );
+    final portHint = switch (_os) {
+      HostOs.windows =>
+        'Open Device Manager and expand Ports (COM & LPT). Example: '
+            'USB-SERIAL CH340 (COM4).',
+      HostOs.macos =>
+        'List the serial devices and look for the adapter. Example: $_serialExample',
+      HostOs.linux =>
+        'List the serial devices and look for the adapter. Example: $_serialExample',
+    };
+    final connectControls = <Widget>[
       Row(
         children: [
           Expanded(
@@ -1770,18 +1899,36 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ],
       ),
+      const SizedBox(height: 8),
+      _recoveryStatusLine(theme),
       const SizedBox(height: 6),
-      _guideText(theme, 'Speed: 115200 baud. Status: $_recoveryStatus'),
-      const SizedBox(height: 4),
-      _guideText(theme, 'Then power on the router.'),
+      _guideText(theme,
+          'Speed: 115200 baud (8-N-1). If the connection fails, the status turns '
+          'red and a red notification explains why. Close any other program that '
+          'may be using the port (screen, PuTTY, Arduino IDE).'),
     ];
 
-    var n = 0;
     final steps = <Widget>[
-      _guideStep(theme, ++n, 'Open the Serial Console', [
+      _guideStep(theme, 1, 'Plug the adapter back in and find the port', [
         _guideText(theme,
-            'Pick your ${_isWindows ? 'COM port (the one found in Device Manager)' : 'port'} '
-            'and connect. This replaces:'),
+            'The adapter was unplugged in step 2. Plug it into your '
+            '${_os.machine} now.'),
+        const SizedBox(height: 6),
+        _guideText(theme, portHint),
+        if (!_isWindows) _guideCode(theme, _listSerialCommand),
+        const SizedBox(height: 4),
+        detectedPorts,
+        if (_os == HostOs.linux) ...[
+          const SizedBox(height: 6),
+          _guideText(theme,
+              'Opening the port needs the dialout group (uucp on Arch). Log out '
+              'and back in after running:'),
+          _guideCode(theme, 'sudo usermod -aG dialout \$USER'),
+        ],
+      ]),
+      _guideStep(theme, 2, 'Connect the serial console', [
+        _guideText(theme,
+            'Select the port and press Connect. This replaces PuTTY or screen:'),
         _guideCode(
           theme,
           switch (_os) {
@@ -1791,57 +1938,76 @@ class _HomeScreenState extends State<HomeScreen> {
           },
           copyable: !_isWindows,
         ),
-        ...connectStep,
+        const SizedBox(height: 8),
+        ...connectControls,
       ]),
-      _guideStep(theme, ++n, 'Enter the Bootloader Menu', [
+    ];
+    return _stepsCard(steps);
+  }
+
+  Widget _loadImageCard(ThemeData theme) {
+    final steps = <Widget>[
+      _guideStep(theme, 1, 'Stop the reboot', [
         _guideText(theme,
-            'Power on the router while watching the console. As soon as U-Boot '
-            'starts counting down ("Hit any key to stop autoboot"), press Enter '
-            'in the console to stop the boot before the installed firmware '
-            'starts. You should then see:'),
-        _guideCode(theme,
-            '1. Start default\n2. Upgrade firmware\n3. Upgrade bootloader\n'
-            '4. Load image\n5. U-Boot console',
-            copyable: false),
+            'As soon as the bootloader starts counting down ("Hit any key to '
+            'stop autoboot"), send Enter or press any key in the console. This '
+            'stops the boot before the installed firmware starts.'),
+        const SizedBox(height: 6),
+        _guideText(theme,
+            'If the router has already finished booting, unplug its power '
+            'adapter and plug it back in while watching the console.'),
+        const SizedBox(height: 8),
+        _guideText(theme, 'The bootloader menu should now appear:'),
+        _guideCode(
+          theme,
+          '1. Start default\n2. Upgrade firmware\n3. Upgrade bootloader\n'
+          '4. Load image\n5. U-Boot console',
+          copyable: false,
+        ),
       ]),
-      _guideStep(theme, ++n, 'Load OpenWrt', [
+      _guideStep(theme, 2, 'Choose "Load image"', [
         _guideText(theme,
-            'Do the whole transfer from the Serial Console: use its quick '
-            'buttons or type the answer in its input field. Send these in order:'),
-        _guideBullet(theme, '1. Send 4 ("4. Load image").'),
-        _guideBullet(theme,
-            '2. At the transfer list, press Enter to choose "TFTP client '
-            '(Default)". The numbered entries (Xmodem, Ymodem, Kermit, S-Record) '
-            'are not used here.'),
-        _guideBullet(theme,
-            '3. At "Input U-Boot\'s IP address", "Input TFTP server\'s IP '
-            'address" and "Input IP netmask", press Enter to keep the values '
-            'U-Boot already shows: $_bootloaderIp, $_tftpServerIp and '
-            '$_networkMask. Typing replaces them, so just press Enter.'),
-        _guideBullet(theme,
-            '4. At "Input file name", send the name below ("Send filename" types '
-            'it for you):'),
+            'Send 4 in the console, or click the "4. Load image" button in the '
+            'console panel.'),
+      ]),
+      _guideStep(theme, 3, 'Choose the TFTP client', [
+        _guideText(theme,
+            'The transfer menu lists TFTP Client (Default), Xmodem and others. '
+            'Choose TFTP Client: press Enter or 1, or click the "1. Start '
+            'Default" button in the console panel.'),
+      ]),
+      _guideStep(theme, 4, 'Accept the network values and send the file name', [
+        _guideText(theme,
+            'At "Input U-Boot\'s IP address", "Input TFTP server\'s IP address" '
+            'and "Input IP netmask", press Enter to accept the values U-Boot '
+            'shows: $_bootloaderIp, $_tftpServerIp and $_networkMask.'),
+        const SizedBox(height: 6),
+        _guideText(theme,
+            'At "Input file name", click "Send filename" in the console panel, or '
+            'type the file name shown below.'),
         _guideCode(theme, _initramfsName, copyable: false),
-        _guideBullet(theme,
-            '5. At "run loaded data now? (Y/n)", press Enter to accept Y, or '
-            'press "Y. Run image". The router boots into temporary OpenWrt.'),
         if (_openwrtInitramfsPath == null) ...[
           const SizedBox(height: 4),
           _callout(
             theme,
             Icons.info_outline,
             'Default firmware not selected',
-            'The name above is the built-in default. Download it in step 3 above '
-            'so the TFTP server can serve it.',
+            'The name above is the built-in default. Download it in step 1 of '
+                'this guide so the TFTP server can serve it.',
           ),
         ],
+      ]),
+      _guideStep(theme, 5, 'Run the loaded image', [
+        _guideText(theme,
+            'At "run loaded data now? (Y/n)", send Y or click "Y. Run image" in '
+            'the console panel. The router boots into temporary OpenWrt.'),
         const SizedBox(height: 8),
         _callout(
           theme,
           Icons.info_outline,
-          'Note',
-          'OpenWrt runs from RAM only. It is not permanently installed and will be '
-              'lost after reboot.',
+          'Temporary OpenWrt',
+          'OpenWrt runs from RAM only. It is not permanently installed and will '
+              'be lost after a reboot, so continue with step 6 to install it.',
         ),
       ]),
     ];
@@ -1850,9 +2016,10 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _installCard(ThemeData theme) {
     final steps = <Widget>[
-      _guideStep(theme, 1, 'Start a Temporary HTTP Server', [
+      _guideStep(theme, 1, 'Start the HTTP Server', [
         _guideText(theme,
-            'Serves the firmware folder on port 8080. This replaces:'),
+            'Once temporary OpenWrt has booted, start the built-in HTTP server. '
+            'It serves the firmware folder on port 8080. This replaces:'),
         _guideCode(
           theme,
           _isWindows
@@ -1977,8 +2144,13 @@ class _HomeScreenState extends State<HomeScreen> {
           children: [
             Text('No Serial Output', style: theme.textTheme.titleSmall),
             const SizedBox(height: 6),
-            _guideBullet(theme, 'Verify TX goes to TX and RX goes to RX.'),
+            _guideBullet(theme,
+                'Check the TX/RX wiring. Some boards are straight (TX → TX, '
+                'RX → RX); others are crossed (TX → RX, RX → TX). If you see no '
+                'output, swap the two wires and try again.'),
             _guideBullet(theme, 'Ensure GND is connected.'),
+            _guideBullet(theme,
+                'Confirm the router is powered on and its power LED is ON.'),
             if (_isWindows) ...[
               _guideBullet(theme, 'Confirm the correct COM port in Device Manager.'),
               _guideBullet(theme, 'Make sure the console is using 115200 baud.'),
@@ -1998,13 +2170,16 @@ class _HomeScreenState extends State<HomeScreen> {
             const Divider(height: 24),
             Text('Cannot Download Firmware', style: theme.textTheme.titleSmall),
             const SizedBox(height: 6),
+            _guideText(theme,
+                'Confirm the Ethernet cable from the router\'s LAN port is '
+                'connected to your ${_os.machine}.'),
             _guideText(theme, 'Verify your ${_os.machine} has the correct IP:'),
             _guideCode(theme, _showIpCommand),
             _guideText(theme, 'Expected: 192.168.1.2'),
             const SizedBox(height: 4),
             _guideText(theme,
                 'Ensure the TFTP server is running, the HTTP server is running '
-                '(Install OpenWrt Firmware → step 1) and the firmware files were '
+                '(step 6 → Start the HTTP Server) and the firmware files were '
                 'copied to the firmware folder.'),
             const SizedBox(height: 4),
             ...switch (_os) {
@@ -2092,11 +2267,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               ],
             ),
-            Text(
-              _serialConnected ? '$_selectedSerialPort · 115200 baud' : _recoveryStatus,
-              style: theme.textTheme.bodySmall
-                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
-            ),
+            _recoveryStatusLine(theme),
             const SizedBox(height: 8),
             if (height == null) Expanded(child: output) else SizedBox(height: height, child: output),
             const SizedBox(height: 8),
@@ -2128,17 +2299,24 @@ class _HomeScreenState extends State<HomeScreen> {
               spacing: 8,
               runSpacing: 8,
               children: [
-                OutlinedButton(
-                  onPressed: _serialConnected ? () => _sendSerial('\n') : null,
-                  child: const Text('Enter'),
-                ),
-                OutlinedButton(
-                  onPressed: _serialConnected ? () => _sendSerial('1\n') : null,
-                  child: const Text('1. Start default'),
+                Tooltip(
+                  message: 'Send Enter — stops autoboot and accepts prompts',
+                  child: OutlinedButton(
+                    onPressed: _serialConnected ? () => _sendSerial('\n') : null,
+                    child: const Text('Enter'),
+                  ),
                 ),
                 OutlinedButton(
                   onPressed: _serialConnected ? () => _sendSerial('4\n') : null,
                   child: const Text('4. Load image'),
+                ),
+                Tooltip(
+                  message:
+                      'Choose TFTP Client (the default) at the transfer menu',
+                  child: OutlinedButton(
+                    onPressed: _serialConnected ? () => _sendSerial('1\n') : null,
+                    child: const Text('1. Start Default'),
+                  ),
                 ),
                 OutlinedButton(
                   onPressed: _serialConnected ? _sendInitramfsName : null,
@@ -2149,15 +2327,15 @@ class _HomeScreenState extends State<HomeScreen> {
                   child: const Text('Y. Run image'),
                 ),
                 OutlinedButton(
+                  onPressed: _serialConnected ? () => _sendSerial('\x03') : null,
+                  child: const Text('Ctrl+C'),
+                ),
+                OutlinedButton(
                   onPressed: _serialConnected ? _confirmResetConfig : null,
                   style: OutlinedButton.styleFrom(
                     foregroundColor: theme.colorScheme.error,
                   ),
                   child: const Text('Reset config'),
-                ),
-                OutlinedButton(
-                  onPressed: _serialConnected ? () => _sendSerial('\x03') : null,
-                  child: const Text('Ctrl+C'),
                 ),
               ],
             ),
@@ -2177,7 +2355,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _confirmResetConfig() async {
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
+      builder: (context) => _dialog(
         icon: const Icon(Icons.warning_amber_rounded),
         title: const Text('Reset the router configuration?'),
         content: const Text(
@@ -2202,13 +2380,13 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _confirmSysupgrade() async {
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
+      builder: (context) => _dialog(
         icon: const Icon(Icons.warning_amber_rounded),
         title: const Text('Install OpenWrt permanently?'),
         content: Text(
           'This sends "$_sysupgradeCommand" to the router. It erases the current '
           'firmware, installs OpenWrt and reboots.\n\n'
-          'Make sure the download in step 2 succeeded. Do not disconnect power '
+          'Make sure the download in step 6 succeeded. Do not disconnect power '
           'during the upgrade.',
         ),
         actions: [
@@ -2420,6 +2598,37 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  /// An inline status message. Errors are always red so a failure can never be
+  /// mistaken for routine progress, on any tab.
+  Widget _inlineStatus(
+    ThemeData theme,
+    String message, {
+    bool error = false,
+  }) {
+    final color =
+        error ? theme.colorScheme.error : theme.colorScheme.onSurfaceVariant;
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(error ? Icons.error_outline : Icons.info_outline,
+            size: 16, color: color),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Text(
+            message,
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: color,
+              fontWeight: error ? FontWeight.w600 : null,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _recoveryStatusLine(ThemeData theme) =>
+      _inlineStatus(theme, _recoveryStatus, error: _recoveryStatusIsError);
+
   Widget _serverStatusLine(
     ThemeData theme,
     String message, {
@@ -2533,6 +2742,30 @@ class _HomeScreenState extends State<HomeScreen> {
         child: Text(text, style: theme.textTheme.titleMedium),
       );
 
+  Widget _stepHeader(ThemeData theme, int number, String text) => Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: Row(
+          children: [
+            CircleAvatar(
+              radius: 14,
+              backgroundColor: theme.colorScheme.primary,
+              child: Text(
+                '$number',
+                style: theme.textTheme.labelLarge
+                    ?.copyWith(color: theme.colorScheme.onPrimary),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                'Step $number · $text',
+                style: theme.textTheme.titleMedium,
+              ),
+            ),
+          ],
+        ),
+      );
+
   Widget _discoveryCard(ThemeData theme) {
     return Card(
       child: Padding(
@@ -2571,7 +2804,17 @@ class _HomeScreenState extends State<HomeScreen> {
                     child: CircularProgressIndicator(strokeWidth: 2),
                   ),
                 if (_discoveryBusy) const SizedBox(width: 12),
-                Expanded(child: Text(_discoveryStatus)),
+                Expanded(
+                  child: Text(
+                    _discoveryStatus,
+                    style: _discoveryStatusIsError
+                        ? TextStyle(
+                            color: theme.colorScheme.error,
+                            fontWeight: FontWeight.w600,
+                          )
+                        : null,
+                  ),
+                ),
               ],
             ),
             if (_network != null) ...[
