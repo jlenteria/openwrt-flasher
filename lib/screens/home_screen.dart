@@ -515,6 +515,70 @@ class _HomeScreenState extends State<HomeScreen> {
   static String _shortHash(String value) =>
       value.length <= 16 ? value : '${value.substring(0, 16)}...';
 
+  static const String _appVersion = '1.0.0+1';
+  static const String _repositoryUrl =
+      'https://github.com/jlenteria/openwrt-flasher';
+
+  void _showAbout() {
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        final theme = Theme.of(dialogContext);
+        return _dialog(
+          icon: const Icon(Icons.router_outlined),
+          title: const Text('About OpenWrt Flasher'),
+          content: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text(
+                  'Flash and recover OpenWrt boards over SSH, serial, TFTP and '
+                  'HTTP.',
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  'Version $_appVersion',
+                  style: theme.textTheme.titleSmall,
+                ),
+                const SizedBox(height: 12),
+                const Text(
+                  'Includes a UART console, a built-in TFTP server for U-Boot '
+                  'recovery, and an HTTP server for installing the sysupgrade '
+                  'image.',
+                ),
+                const SizedBox(height: 12),
+                Text('Source code', style: theme.textTheme.titleSmall),
+                const SizedBox(height: 4),
+                const SelectableText(
+                  _repositoryUrl,
+                  style: TextStyle(fontFamily: 'monospace'),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(dialogContext).pop();
+                showLicensePage(
+                  context: context,
+                  applicationName: 'OpenWrt Flasher',
+                  applicationVersion: _appVersion,
+                );
+              },
+              child: const Text('Licenses'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('Close'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
   /// Dialogs never stretch across a wide window; on small windows the inset
   /// padding keeps them inside the screen.
   AlertDialog _dialog({
@@ -1343,6 +1407,13 @@ class _HomeScreenState extends State<HomeScreen> {
         appBar: AppBar(
           title: const Text('OpenWrt Flasher'),
           backgroundColor: theme.colorScheme.primaryContainer,
+          actions: [
+            IconButton(
+              onPressed: _showAbout,
+              icon: const Icon(Icons.info_outline),
+              tooltip: 'About OpenWrt Flasher',
+            ),
+          ],
           bottom: const TabBar(
             tabs: [
               Tab(text: 'Flash'),
