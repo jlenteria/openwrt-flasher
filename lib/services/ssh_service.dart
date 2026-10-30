@@ -82,6 +82,8 @@ class SSHService {
   static const uploadOverallTimeout = Duration(minutes: 20);
   static const remoteFirmwarePath = '/tmp/openwrt-flasher-sysupgrade.bin';
   static const remoteBackupPath = '/tmp/openwrt-flasher-config-backup.tar.gz';
+  static const remoteConfigRestorePath =
+      '/tmp/openwrt-flasher-config-restore.tar.gz';
 
   /// Deliberately excludes space, quotes, `$`, backticks, `;`, `|` and `&`.
   static final RegExp _safeRemotePath = RegExp(r'^[A-Za-z0-9._/@+:-]+$');
@@ -395,8 +397,9 @@ class SSHService {
   Future<void> uploadFirmware(
     String localPath,
     String remotePath,
-    void Function(double progress) onProgress,
-  ) async {
+    void Function(double progress) onProgress, {
+    String subject = 'firmware',
+  }) async {
     final client = _client;
     if (client == null) {
       throw const SSHOperationException('Not connected to the router.');
@@ -415,11 +418,11 @@ class SSHService {
 
     final file = File(localPath);
     if (!await file.exists()) {
-      throw SSHOperationException('Firmware file is missing: $localPath');
+      throw SSHOperationException('The $subject file is missing: $localPath');
     }
     final fileSize = await file.length();
     if (fileSize == 0) {
-      throw const SSHOperationException('The selected firmware file is empty.');
+      throw SSHOperationException('The selected $subject is empty.');
     }
 
     final neededKb = (fileSize / 1024).ceil() + 10240;
@@ -675,6 +678,32 @@ class SSHService {
       return await _readRemoteBytes(quoted, label: 'configuration backup');
     } finally {
       await exec('rm -f $quoted');
+    }
+  }
+
+  /// Uploads a `sysupgrade -b` archive and starts `sysupgrade -r`, which
+  /// restores `/etc` and reboots the router. As with [flashFirmware], a
+  /// dropped channel after the command is issued is expected.
+  Future<void> restoreConfigBackup(
+    String localPath, {
+    void Function(double progress)? onProgress,
+  }) async {
+    await uploadFirmware(
+      localPath,
+      remoteConfigRestorePath,
+      onProgress ?? (_) {},
+      subject: 'configuration backup',
+    );
+    final quoted = quotePath(remoteConfigRestorePath, label: 'remote path');
+    final result = await exec(
+      'sysupgrade -r $quoted </dev/null >/tmp/openwrt-flasher.log 2>&1 &',
+      timeout: const Duration(seconds: 30),
+    );
+    if (result.executed && result.exitCode != null && result.exitCode != 0) {
+      throw SSHOperationException(
+        'The router could not start the restore (exit ${result.exitCode}): '
+        '${result.summary}',
+      );
     }
   }
 

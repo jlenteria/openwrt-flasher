@@ -207,4 +207,25 @@ void main() {
     expect(find.text('Find more devices'), findsNothing);
     expect(find.text('Router IP address'), findsNothing);
   });
+
+  testWidgets('restoring a backup needs an identified router and a file',
+      (tester) async {
+    tester.view.physicalSize = const Size(1200, 8000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(app());
+
+    final restoreButton = find.widgetWithText(FilledButton, 'Restore backup');
+    expect(
+      find.textContaining('Restore a configuration backup'),
+      findsOneWidget,
+    );
+    expect(
+      tester.widget<FilledButton>(restoreButton).onPressed,
+      isNull,
+      reason: 'nothing may be uploaded before the router is identified',
+    );
+    expect(find.textContaining('Identify the router first'), findsOneWidget);
+    expect(find.text('No backup selected'), findsOneWidget);
+  });
 }

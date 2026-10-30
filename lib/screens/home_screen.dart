@@ -155,6 +155,13 @@ class _HomeScreenState extends State<HomeScreen> {
   RouterInfo? _verifiedAfter;
   String? _backupFile;
 
+  // Configuration restore (the reverse of the flash-time backup).
+  String? _restorePath;
+  bool _restoring = false;
+  double _restoreProgress = 0;
+  String? _restoreStatus;
+  bool _restoreError = false;
+
   /// True once `sysupgrade` has been started. From then on the image is
   /// written even if the router cannot be re-identified, so a confirmation
   /// timeout is reported as "installed but unconfirmed", never as a failure.
@@ -871,6 +878,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _flash() async {
+    if (_restoring) return;
     final router = _router;
     final firmware = _firmware;
     final path = _firmwarePath;
@@ -1127,6 +1135,113 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> _pickRestoreBackup() async {
+    final result = await FilePicker.platform.pickFiles(
+      dialogTitle: 'Choose the configuration backup',
+      type: FileType.custom,
+      allowedExtensions: const ['gz', 'tgz', 'tar'],
+    );
+    final path = result?.files.single.path;
+    if (path == null) return;
+    _runOnUi(() {
+      _restorePath = path;
+      _restoreStatus = null;
+      _restoreError = false;
+    });
+  }
+
+  Future<void> _restoreBackup() async {
+    if (_flashing || _restoring) return;
+    final router = _router;
+    final path = _restorePath;
+    if (router == null) {
+      _showErrorToast('Identify the router over SSH before restoring a backup.');
+      return;
+    }
+    if (path == null) {
+      _showErrorToast('Choose a configuration backup (.tar.gz) first.');
+      return;
+    }
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        icon: const Icon(Icons.settings_backup_restore),
+        title: const Text('Restore this configuration?'),
+        content: const Text(
+          'The backup is uploaded to the router and "sysupgrade -r" restores '
+          '/etc from it. The firmware is not changed, but the router reboots '
+          'and may come back at the address saved in the backup.\n\n'
+          'Do not disconnect power while it restores.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Restore'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    _runOnUi(() {
+      _restoring = true;
+      _restoreProgress = 0;
+      _restoreError = false;
+      _restoreStatus = 'Uploading the configuration backup...';
+    });
+    try {
+      await _ssh.connect(
+        router.ip,
+        _usernameController.text,
+        _passwordController.text,
+      );
+      final live = await _ssh.identify(router.ip);
+      if (live.boardName != router.boardName) {
+        throw SSHOperationException(
+          'The router now reports board name "${live.boardName}" instead of '
+          '"${router.boardName}". Nothing was restored.',
+        );
+      }
+      _runOnUi(() => _restoreStatus = 'Uploading the configuration backup...');
+      await _ssh.restoreConfigBackup(
+        path,
+        onProgress: (value) {
+          if (!mounted) return;
+          _runOnUi(() => _restoreProgress = value.clamp(0.0, 1.0));
+        },
+      );
+      if (!mounted) return;
+      _runOnUi(() {
+        _restoring = false;
+        _restoreProgress = 1;
+        _restoreStatus = 'Restore started. The router is rebooting and may '
+            'return at the address saved in the backup.';
+      });
+    } on SSHOperationException catch (error) {
+      if (!mounted) return;
+      _runOnUi(() {
+        _restoring = false;
+        _restoreError = true;
+        _restoreStatus = 'Restore failed: ${error.message}';
+      });
+      _showErrorToast('Could not restore the configuration. ${error.message}');
+    } on Object catch (error) {
+      if (!mounted) return;
+      _runOnUi(() {
+        _restoring = false;
+        _restoreError = true;
+        _restoreStatus = 'Restore failed: $error';
+      });
+      _showErrorToast('Could not restore the configuration: $error');
+    } finally {
+      await _ssh.disconnect();
+    }
+  }
+
   Future<void> _cancelUpload() async {
     _runOnUi(() => _cancelRequested = true);
     await _ssh.cancelUpload();
@@ -1205,7 +1320,7 @@ class _HomeScreenState extends State<HomeScreen> {
         Center(
           child: FilledButton.icon(
             key: HomeScreen.flashButtonKey,
-            onPressed: _canFlash ? _flash : null,
+            onPressed: _canFlash && !_restoring ? _flash : null,
             icon: const Icon(Icons.flash_on),
             label: const Text('Flash firmware'),
             style: FilledButton.styleFrom(
@@ -1224,6 +1339,11 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ),
         ],
+        const SizedBox(height: 24),
+        const Divider(),
+        const SizedBox(height: 8),
+        _header(theme, '6. Restore a configuration backup'),
+        _restoreCard(theme),
       ],
     );
   }
@@ -2332,7 +2452,7 @@ class _HomeScreenState extends State<HomeScreen> {
     String? path,
     String placeholder,
     String buttonLabel,
-    VoidCallback onPick,
+    VoidCallback? onPick,
   ) {
     return Row(
       children: [
@@ -2750,6 +2870,84 @@ class _HomeScreenState extends State<HomeScreen> {
                 padding: const EdgeInsets.all(8),
                 child: _kv(theme, 'Backup', _backupFile!),
               ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _restoreCard(ThemeData theme) {
+    final ready = _router != null &&
+        _restorePath != null &&
+        !_restoring &&
+        !_flashing;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Puts back the settings saved by "Download a configuration '
+              'backup first". The archive is uploaded and "sysupgrade -r" '
+              'restores /etc; the firmware itself does not change and the '
+              'router reboots. Restore only a backup taken from this same '
+              'router.',
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+            ),
+            const SizedBox(height: 12),
+            _filePickRow(
+              theme,
+              _restorePath,
+              'No backup selected',
+              'Browse...',
+              _restoring ? null : _pickRestoreBackup,
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                FilledButton.tonalIcon(
+                  onPressed: ready ? _restoreBackup : null,
+                  icon: const Icon(Icons.settings_backup_restore),
+                  label: const Text('Restore backup'),
+                ),
+                if (_restoring) ...[
+                  const SizedBox(width: 16),
+                  const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                ],
+              ],
+            ),
+            if (_restoring) ...[
+              const SizedBox(height: 12),
+              LinearProgressIndicator(value: _restoreProgress),
+            ],
+            if (_router == null) ...[
+              const SizedBox(height: 8),
+              Text(
+                'Identify the router first, so its board name can be checked '
+                'before anything is uploaded.',
+                style: theme.textTheme.bodySmall
+                    ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+              ),
+            ],
+            if (_restoreStatus != null) ...[
+              const SizedBox(height: 8),
+              _statusLine(
+                theme,
+                _restoreError
+                    ? CheckOutcome.failed
+                    : (_restoring ? CheckOutcome.warning : CheckOutcome.passed),
+                _restoring
+                    ? 'Restoring'
+                    : (_restoreError ? 'Restore failed' : 'Restore started'),
+                _restoreStatus!,
+              ),
+            ],
           ],
         ),
       ),
