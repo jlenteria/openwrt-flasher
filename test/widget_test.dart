@@ -83,6 +83,33 @@ void main() {
     expect(find.widgetWithText(OutlinedButton, 'Download'), findsNWidgets(2));
   });
 
+  testWidgets('the U-Boot file prompt offers the default firmware name',
+      (tester) async {
+    tester.view.physicalSize = const Size(1000, 30000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(app());
+
+    await tester.tap(find.text('Recovery'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('default-firmware.bin'), findsOneWidget);
+    expect(find.textContaining('run loaded data now? (Y/n)'), findsOneWidget);
+    expect(
+      find.widgetWithText(OutlinedButton, 'Send filename'),
+      findsOneWidget,
+      reason: 'the filename is sent from the console, not the guide',
+    );
+    expect(find.widgetWithText(OutlinedButton, 'Y. Run image'), findsOneWidget);
+    expect(
+      find.widgetWithText(OutlinedButton, 'Accept default'),
+      findsNothing,
+      reason: 'the guide must not duplicate the console buttons',
+    );
+    expect(find.textContaining('Hit any key to stop autoboot'), findsOneWidget);
+    expect(find.text('Reset config'), findsOneWidget);
+  });
+
   group('the recovery guide matches the OS', () {
     // Text that may only ever appear in one OS's guide.
     const exclusive = {

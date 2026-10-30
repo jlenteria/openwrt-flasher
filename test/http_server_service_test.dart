@@ -22,8 +22,10 @@ void main() {
     final folder = Directory.systemTemp.createTempSync('openwrt-flasher-');
     addTearDown(() => folder.deleteSync(recursive: true));
 
+    // Port 0 asks the OS for a free port, so the test does not collide with
+    // the app (which holds 8080 while it is running) or any other process.
     final first = HttpServerService();
-    final port = await first.start(folder.path);
+    final port = await first.start(folder.path, port: 0);
     expect(port, isNotNull);
     addTearDown(first.dispose);
 

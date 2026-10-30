@@ -261,6 +261,26 @@ class _HomeScreenState extends State<HomeScreen> {
     _serialService.write(data);
   }
 
+  /// U-Boot pre-fills the IP and netmask prompts. Erasing the line first keeps
+  /// the typed value from being appended to that existing text.
+  void _sendPromptValue(String value) {
+    final erase = List<String>.filled(80, '\b').join();
+    _serialService.write('$erase$value\n');
+  }
+
+  Future<void> _sendInitramfsName() async {
+    final name = _initramfsName;
+    final file = File('$_tftpDir${Platform.pathSeparator}$name');
+    if (!await file.exists()) {
+      _showErrorToast(
+        '$_tftpDir does not contain $name yet. Download the default firmware in '
+        'step 3 or press Copy Files in step 4 first.',
+      );
+      return;
+    }
+    _sendPromptValue(name);
+  }
+
   void _clearConsole() {
     _runOnUi(() {
       _consoleBuffer.clear();
@@ -1286,6 +1306,11 @@ class _HomeScreenState extends State<HomeScreen> {
   static const _firmwareSelectorLink = 'https://firmware-selector.openwrt.org/';
   static const _tableOfHardwareLink = 'https://openwrt.org/toh/start';
 
+  /// Values the U-Boot "load image" prompts expect for TFTP recovery.
+  static const _bootloaderIp = '192.168.1.1';
+  static const _tftpServerIp = '192.168.1.2';
+  static const _networkMask = '255.255.255.0';
+
   HostOs get _os => widget.hostOs ?? HostOs.current;
   bool get _isWindows => _os == HostOs.windows;
 
@@ -1320,6 +1345,12 @@ class _HomeScreenState extends State<HomeScreen> {
   String get _firmwareName => _sysupgradeImagePath == null
       ? 'openwrt-sysupgrade.bin'
       : _basename(_sysupgradeImagePath!);
+
+  /// The name U-Boot must ask the TFTP server for. Falls back to the built-in
+  /// default image, so the name is known before anything is downloaded.
+  String get _initramfsName => _openwrtInitramfsPath == null
+      ? FirmwareDownloadService.defaultFirmwareImages.first.fileName
+      : _basename(_openwrtInitramfsPath!);
 
   String get _serverBase => _httpServerUrl ?? 'http://192.168.1.2:8080';
 
@@ -1716,7 +1747,11 @@ class _HomeScreenState extends State<HomeScreen> {
         ...connectStep,
       ]),
       _guideStep(theme, ++n, 'Enter the Bootloader Menu', [
-        _guideText(theme, 'When the bootloader appears, you should see:'),
+        _guideText(theme,
+            'Power on the router while watching the console. As soon as U-Boot '
+            'starts counting down ("Hit any key to stop autoboot"), press Enter '
+            'in the console to stop the boot before the installed firmware '
+            'starts. You should then see:'),
         _guideCode(theme,
             '1. Start default\n2. Upgrade firmware\n3. Upgrade bootloader\n'
             '4. Load image\n5. U-Boot console',
@@ -1724,29 +1759,35 @@ class _HomeScreenState extends State<HomeScreen> {
       ]),
       _guideStep(theme, ++n, 'Load OpenWrt', [
         _guideText(theme,
-            'Select 4. Load image and choose the OpenWrt Initramfs firmware '
-            '(${_openwrtInitramfsPath == null ? 'not selected yet' : _basename(_openwrtInitramfsPath!)}) '
-            'located in ${_tftpDirController.text}.'),
-        const SizedBox(height: 8),
-        FilledButton.tonalIcon(
-          onPressed: _serialConnected ? () => _sendSerial('4\n') : null,
-          icon: const Icon(Icons.download),
-          label: const Text('Send "4. Load image"'),
-        ),
-        const SizedBox(height: 8),
-        _guideText(theme,
-            'The bootloader then asks for the device IP, the TFTP server IP '
-            '(192.168.1.2) and the file name. Press Enter at each prompt to keep '
-            'the default values, using the console\'s Enter button or the Enter key. '
-            'Only type the initramfs file name if the default does not match it.'),
-        const SizedBox(height: 8),
-        OutlinedButton.icon(
-          onPressed: _serialConnected ? () => _sendSerial('\n') : null,
-          icon: const Icon(Icons.keyboard_return),
-          label: const Text('Send Enter'),
-        ),
-        const SizedBox(height: 8),
-        _guideText(theme, 'The router will boot into a temporary OpenWrt environment.'),
+            'Do the whole transfer from the Serial Console: use its quick '
+            'buttons or type the answer in its input field. Send these in order:'),
+        _guideBullet(theme, '1. Send 4 ("4. Load image").'),
+        _guideBullet(theme,
+            '2. At the transfer list, press Enter to choose "TFTP client '
+            '(Default)". The numbered entries (Xmodem, Ymodem, Kermit, S-Record) '
+            'are not used here.'),
+        _guideBullet(theme,
+            '3. At "Input U-Boot\'s IP address", "Input TFTP server\'s IP '
+            'address" and "Input IP netmask", press Enter to keep the values '
+            'U-Boot already shows: $_bootloaderIp, $_tftpServerIp and '
+            '$_networkMask. Typing replaces them, so just press Enter.'),
+        _guideBullet(theme,
+            '4. At "Input file name", send the name below ("Send filename" types '
+            'it for you):'),
+        _guideCode(theme, _initramfsName, copyable: false),
+        _guideBullet(theme,
+            '5. At "run loaded data now? (Y/n)", press Enter to accept Y, or '
+            'press "Y. Run image". The router boots into temporary OpenWrt.'),
+        if (_openwrtInitramfsPath == null) ...[
+          const SizedBox(height: 4),
+          _callout(
+            theme,
+            Icons.info_outline,
+            'Default firmware not selected',
+            'The name above is the built-in default. Download it in step 3 above '
+            'so the TFTP server can serve it.',
+          ),
+        ],
         const SizedBox(height: 8),
         _callout(
           theme,
@@ -2053,6 +2094,21 @@ class _HomeScreenState extends State<HomeScreen> {
                   child: const Text('4. Load image'),
                 ),
                 OutlinedButton(
+                  onPressed: _serialConnected ? _sendInitramfsName : null,
+                  child: const Text('Send filename'),
+                ),
+                OutlinedButton(
+                  onPressed: _serialConnected ? () => _sendSerial('y\n') : null,
+                  child: const Text('Y. Run image'),
+                ),
+                OutlinedButton(
+                  onPressed: _serialConnected ? _confirmResetConfig : null,
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: theme.colorScheme.error,
+                  ),
+                  child: const Text('Reset config'),
+                ),
+                OutlinedButton(
                   onPressed: _serialConnected ? () => _sendSerial('\x03') : null,
                   child: const Text('Ctrl+C'),
                 ),
@@ -2069,6 +2125,31 @@ class _HomeScreenState extends State<HomeScreen> {
     if (value.isEmpty || !_serialConnected) return;
     _sendSerial('$value\n');
     _consoleInputController.clear();
+  }
+
+  Future<void> _confirmResetConfig() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        icon: const Icon(Icons.warning_amber_rounded),
+        title: const Text('Reset the router configuration?'),
+        content: const Text(
+          'This sends "reset" to the bootloader. It resets the saved '
+          'configuration and restarts the router with the defaults.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Reset config'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) _sendSerial('reset\n');
   }
 
   Future<void> _confirmSysupgrade() async {
