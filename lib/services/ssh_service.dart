@@ -34,22 +34,21 @@ class RemoteCommand {
     required int? exitCode,
     required String stdout,
     required String stderr,
-  }) =>
-      RemoteCommand._(
-        executed: true,
-        exitCode: exitCode,
-        stdout: stdout,
-        stderr: stderr,
-        failure: null,
-      );
+  }) => RemoteCommand._(
+    executed: true,
+    exitCode: exitCode,
+    stdout: stdout,
+    stderr: stderr,
+    failure: null,
+  );
 
   factory RemoteCommand.notRun(String reason) => RemoteCommand._(
-        executed: false,
-        exitCode: null,
-        stdout: '',
-        stderr: '',
-        failure: reason,
-      );
+    executed: false,
+    exitCode: null,
+    stdout: '',
+    stderr: '',
+    failure: reason,
+  );
 
   /// False when the command never reached the router, or the answer was lost.
   final bool executed;
@@ -72,10 +71,7 @@ class RemoteCommand {
 }
 
 class SSHService {
-  SSHService({
-    required this.hostKeys,
-    required this.onUntrustedHostKey,
-  });
+  SSHService({required this.hostKeys, required this.onUntrustedHostKey});
 
   static const socketTimeout = Duration(seconds: 8);
   static const handshakeTimeout = Duration(seconds: 12);
@@ -98,8 +94,7 @@ class SSHService {
   final Future<bool> Function(HostKeyOffer offer) onUntrustedHostKey;
 
   SSHClient? _client;
-  SftpClient? _sftp;
-  SftpFileWriter? _activeWriter;
+  SSHSession? _activeUpload;
   Timer? _idleWatchdog;
   bool _cancelRequested = false;
   bool _hostKeyRejected = false;
@@ -109,7 +104,9 @@ class SSHService {
   /// Wraps a remote path for the shell after rejecting anything that could
   /// break out of the quoting.
   static String quotePath(String path, {String label = 'path'}) {
-    if (path.isEmpty || path.contains('..') || !_safeRemotePath.hasMatch(path)) {
+    if (path.isEmpty ||
+        path.contains('..') ||
+        !_safeRemotePath.hasMatch(path)) {
       throw SSHOperationException(
         'Refusing to use the $label "$path": only letters, digits and '
         '. _ / @ + : - are accepted, so that the value cannot break out of '
@@ -194,7 +191,9 @@ class SSHService {
           'use "Forget pinned host key" beside the router address and retry.',
         );
       }
-      throw SSHOperationException('Cannot open an SSH session on $host: $error');
+      throw SSHOperationException(
+        'Cannot open an SSH session on $host: $error',
+      );
     }
   }
 
@@ -225,16 +224,6 @@ class SSHService {
     }
   }
 
-  Future<SftpClient> _sftpClient() async {
-    final existing = _sftp;
-    if (existing != null) return existing;
-    final client = _client;
-    if (client == null) {
-      throw const SSHOperationException('Not connected to the router.');
-    }
-    return _sftp = await client.sftp();
-  }
-
   /// Reads the device identity over SSH. Only an OpenWrt-family device with a
   /// readable board name and a working `sysupgrade` is accepted.
   Future<RouterInfo> identify(String host) async {
@@ -263,7 +252,9 @@ class SSHService {
 
     final sysupgrade = await exec('command -v sysupgrade');
     if (!sysupgrade.executed) {
-      throw SSHOperationException('Cannot probe the router: ${sysupgrade.summary}');
+      throw SSHOperationException(
+        'Cannot probe the router: ${sysupgrade.summary}',
+      );
     }
     if (!sysupgrade.succeeded || sysupgrade.output.isEmpty) {
       throw const SSHOperationException(
@@ -273,25 +264,25 @@ class SSHService {
     }
 
     final model = await exec('cat /tmp/sysinfo/model');
-    final compat = await exec(
-      "tr '\\0' '\\n' < /proc/device-tree/compatible",
-    );
+    final compat = await exec("tr '\\0' '\\n' < /proc/device-tree/compatible");
     final release = await exec('cat /etc/openwrt_release');
     final versionFile = await exec('cat /etc/openwrt_version');
     final hostname = await exec('uname -n');
 
     final compatIds = compat.succeeded
         ? compat.stdout
-            .split('\n')
-            .map((id) => id.trim())
-            .where((id) => id.length > 3)
-            .toList()
+              .split('\n')
+              .map((id) => id.trim())
+              .where((id) => id.length > 3)
+              .toList()
         : <String>[];
 
     return RouterInfo(
       ip: host,
       boardName: boardName,
-      model: model.succeeded && model.output.isNotEmpty ? model.output : boardName,
+      model: model.succeeded && model.output.isNotEmpty
+          ? model.output
+          : boardName,
       firmwareVersion: _parseVersion(release.output, versionFile.output),
       hostname: hostname.succeeded ? hostname.output : '',
       compatIds: compatIds,
@@ -299,8 +290,9 @@ class SSHService {
   }
 
   static String _parseVersion(String release, String versionFile) {
-    final described =
-        RegExp(r"DISTRIB_DESCRIPTION='([^']*)'").firstMatch(release)?.group(1);
+    final described = RegExp(
+      r"DISTRIB_DESCRIPTION='([^']*)'",
+    ).firstMatch(release)?.group(1);
     for (final candidate in [versionFile, described ?? '', release]) {
       final match = RegExp(r'\d+\.\d+(?:\.\d+)?').firstMatch(candidate);
       if (match != null) return match.group(0)!;
@@ -329,7 +321,9 @@ class SSHService {
     }
     final kb = int.tryParse(fields[3].replaceAll(RegExp(r'[^0-9]'), ''));
     if (kb == null) {
-      throw SSHOperationException('Cannot parse free space from "${lines.last}".');
+      throw SSHOperationException(
+        'Cannot parse free space from "${lines.last}".',
+      );
     }
     return kb;
   }
@@ -376,7 +370,9 @@ class SSHService {
           'cannot be detected. Refusing to flash.',
         );
       }
-      _upgradeProbeTool = tool == 'pgrep' ? 'pgrep -x sysupgrade' : 'pidof sysupgrade';
+      _upgradeProbeTool = tool == 'pgrep'
+          ? 'pgrep -x sysupgrade'
+          : 'pidof sysupgrade';
     }
 
     final result = await exec('$_upgradeProbeTool 2>/dev/null');
@@ -388,9 +384,14 @@ class SSHService {
     return result.exitCode == 0 && result.output.isNotEmpty;
   }
 
-  /// Streams the local file straight to SFTP. Nothing is buffered whole, an
-  /// idle transfer is aborted rather than hanging, and a partial file is
-  /// always removed.
+  /// Streams the local file to the router over the SSH session channel.
+  ///
+  /// Deliberately not SFTP: a router can accept SSH commands and still have no
+  /// SFTP subsystem (Dropbear without openssh-sftp-server), and dartssh2 then
+  /// waits for a handshake that never comes. `cat > file` only needs the shell
+  /// every supported OpenWrt device already provides. An idle transfer is
+  /// aborted rather than hanging, cancellation kills the channel at any stage,
+  /// and a partial file is always removed.
   Future<void> uploadFirmware(
     String localPath,
     String remotePath,
@@ -401,10 +402,16 @@ class SSHService {
       throw const SSHOperationException('Not connected to the router.');
     }
     if (client.isClosed) {
-      throw const SSHOperationException('The SSH connection closed before upload.');
+      throw const SSHOperationException(
+        'The SSH connection closed before upload.',
+      );
     }
+    _cancelRequested = false;
+    _stallReason = null;
+
     final quotedRemote = quotePath(remotePath, label: 'remote path');
     final partPath = '$remotePath.part';
+    final quotedPart = quotePath(partPath, label: 'remote path');
 
     final file = File(localPath);
     if (!await file.exists()) {
@@ -423,77 +430,145 @@ class SSHService {
         'Writing to a full tmpfs can crash the router mid-flash.',
       );
     }
+    if (_cancelRequested) {
+      throw const SSHOperationException(
+        'Upload cancelled. The partial image was deleted and nothing was '
+        'flashed.',
+      );
+    }
 
-    _cancelRequested = false;
-    _stallReason = null;
-    SftpFile? remote;
+    SSHSession? session;
+    final errorText = StringBuffer();
     try {
-      final sftp = await _sftpClient();
-      remote = await sftp.open(
-        partPath,
-        mode: SftpFileOpenMode.create |
-            SftpFileOpenMode.truncate |
-            SftpFileOpenMode.write,
-      );
-      final Stream<Uint8List> stream = file.openRead().map<Uint8List>(
-        (chunk) => chunk is Uint8List ? chunk : Uint8List.fromList(chunk),
-      );
-      final writer = remote.write(
-        stream,
-        onProgress: (total) {
-          _lastProgressAt = DateTime.now();
-          onProgress(total / fileSize);
-        },
-      );
-      _activeWriter = writer;
-      _armIdleWatchdog(writer);
+      try {
+        session = await client
+            .execute('cat > $quotedPart')
+            .timeout(const Duration(seconds: 15));
+      } on TimeoutException {
+        throw const SSHOperationException(
+          'The router did not start the upload within 15s. Nothing was flashed.',
+        );
+      } on Object catch (error) {
+        throw SSHOperationException(
+          'The router refused to start the upload: $error',
+        );
+      }
+      _activeUpload = session;
+      // Both pipes must be drained or the channel stalls once its window fills.
+      session.stdout.listen((_) {}, onError: (_) {});
+      session.stderr.listen((data) {
+        if (errorText.length < 4096) {
+          errorText.write(utf8.decode(data, allowMalformed: true));
+        }
+      }, onError: (_) {});
 
-      await writer.done.timeout(uploadOverallTimeout);
-      _cancelIdleWatchdog();
-      _activeWriter = null;
+      var sent = 0;
+      var lastShownPercent = -1;
+      _armIdleWatchdog();
 
+      final stream = file
+          .openRead()
+          .map<Uint8List>(
+            (chunk) => chunk is Uint8List ? chunk : Uint8List.fromList(chunk),
+          )
+          .transform(
+            StreamTransformer<Uint8List, Uint8List>.fromHandlers(
+              handleData: (chunk, sink) {
+                sent += chunk.length;
+                _lastProgressAt = DateTime.now();
+                final percent = (sent / fileSize * 100).clamp(0, 100).toInt();
+                if (percent != lastShownPercent) {
+                  lastShownPercent = percent;
+                  onProgress((sent / fileSize).clamp(0.0, 1.0));
+                }
+                sink.add(chunk);
+              },
+            ),
+          );
+
+      try {
+        // Backpressure comes from the SSH channel window, so this only runs
+        // ahead of the router by at most one window.
+        await session.stdin.addStream(stream).timeout(uploadOverallTimeout);
+      } on TimeoutException {
+        throw SSHOperationException(
+          'Upload exceeded ${uploadOverallTimeout.inMinutes} minutes.',
+        );
+      } on Object catch (error) {
+        if (_cancelRequested) {
+          throw const SSHOperationException(
+            'Upload cancelled. The partial image was deleted and nothing was '
+            'flashed.',
+          );
+        }
+        if (_stallReason != null) {
+          throw SSHOperationException(
+            '$_stallReason $sent of $fileSize bytes had been sent.',
+          );
+        }
+        throw SSHOperationException('The upload was interrupted: $error');
+      }
+      try {
+        await session.stdin.close().timeout(const Duration(seconds: 15));
+      } on TimeoutException {
+        // The exit status below still decides whether anything was written.
+      } catch (_) {
+        // A destroyed channel (cancel or stall) is reported below.
+      }
+
+      final exitCode = await session.waitForExit(
+        timeout: const Duration(seconds: 60),
+      );
       if (_cancelRequested) {
-        throw SSHOperationException('Upload cancelled by you.');
+        throw const SSHOperationException(
+          'Upload cancelled. The partial image was deleted and nothing was '
+          'flashed.',
+        );
       }
       if (_stallReason != null) {
         throw SSHOperationException(
-          '$_stallReason ${writer.progress} of $fileSize bytes had been sent.',
+          '$_stallReason $sent of $fileSize bytes had been sent.',
         );
       }
-      if (writer.progress != fileSize) {
+      if (exitCode == null) {
+        throw const SSHOperationException(
+          'The router never reported that the upload finished, so the image '
+          'cannot be trusted. Nothing was flashed.',
+        );
+      }
+      if (exitCode != 0) {
+        final detail = errorText.toString().trim();
         throw SSHOperationException(
-          'Upload ended after ${writer.progress} of $fileSize bytes.',
+          'The router refused the upload (exit $exitCode)'
+          '${detail.isEmpty ? '.' : ': $detail'}',
+        );
+      }
+      if (sent != fileSize) {
+        throw SSHOperationException(
+          'Upload ended after $sent of $fileSize bytes.',
         );
       }
 
-      await remote.close();
-      remote = null;
       require(await exec('sync'), 'Flushing the uploaded image to disk');
       require(
-        await exec(
-          'mv ${quotePath(partPath, label: 'remote path')} $quotedRemote',
-        ),
+        await exec('mv $quotedPart $quotedRemote'),
         'Moving the uploaded image into place',
       );
       await exec('sync');
-    } on TimeoutException {
-      throw SSHOperationException(
-        'Upload exceeded ${uploadOverallTimeout.inMinutes} minutes.',
-      );
     } finally {
       _cancelIdleWatchdog();
-      _activeWriter = null;
+      _activeUpload = null;
       try {
-        await remote?.close();
+        session?.close();
       } catch (_) {}
       // Never leave a truncated image that could be mistaken for a good one.
-      await exec('rm -f ${quotePath(partPath, label: 'remote path')}');
+      await exec('rm -f $quotedPart');
     }
   }
 
   DateTime? _lastProgressAt;
 
-  void _armIdleWatchdog(SftpFileWriter writer) {
+  void _armIdleWatchdog() {
     _lastProgressAt = DateTime.now();
     _cancelIdleWatchdog();
     _idleWatchdog = Timer.periodic(const Duration(seconds: 5), (timer) {
@@ -502,8 +577,9 @@ class SSHService {
         return;
       }
       timer.cancel();
-      _stallReason = 'Upload made no progress for ${uploadIdleTimeout.inSeconds}s.';
-      writer.abort().catchError((_) {});
+      _stallReason =
+          'Upload made no progress for ${uploadIdleTimeout.inSeconds}s.';
+      _abortActiveUpload();
     });
   }
 
@@ -512,14 +588,19 @@ class SSHService {
     _idleWatchdog = null;
   }
 
+  /// Tears down the in-flight upload channel, unblocking any pending write.
+  void _abortActiveUpload() {
+    final session = _activeUpload;
+    _activeUpload = null;
+    try {
+      session?.channel.destroy();
+    } catch (_) {}
+  }
+
   /// Requests cancellation of an in-flight upload.
   Future<void> cancelUpload() async {
-    final writer = _activeWriter;
-    if (writer == null) return;
     _cancelRequested = true;
-    try {
-      await writer.abort().timeout(const Duration(seconds: 5));
-    } catch (_) {}
+    _abortActiveUpload();
   }
 
   /// Runs `sysupgrade -T`, treating a missing or unreported status as a
@@ -588,14 +669,46 @@ class SSHService {
       return null;
     }
 
-    final sftp = await _sftpClient();
-    final remote = await sftp.open(remoteBackupPath);
+    // Read it back over the command channel for the same reason the upload
+    // uses it: SFTP is optional on OpenWrt, the shell is not.
     try {
-      return await remote.readBytes();
+      return await _readRemoteBytes(quoted, label: 'configuration backup');
     } finally {
-      await remote.close();
       await exec('rm -f $quoted');
     }
+  }
+
+  Future<Uint8List> _readRemoteBytes(
+    String quotedPath, {
+    required String label,
+  }) async {
+    final client = _client;
+    if (client == null) {
+      throw const SSHOperationException('Not connected to the router.');
+    }
+    final SSHRunResult result;
+    try {
+      result = await client
+          .runWithResult('cat $quotedPath', stdout: true, stderr: true)
+          .timeout(const Duration(minutes: 2));
+    } on TimeoutException {
+      throw SSHOperationException(
+        'Reading the $label from the router did not finish within 2 minutes.',
+      );
+    } on Object catch (error) {
+      throw SSHOperationException(
+        'Reading the $label from the router failed: $error',
+      );
+    }
+    if (result.exitCode != 0) {
+      final detail = utf8.decode(result.stderr, allowMalformed: true).trim();
+      throw SSHOperationException(
+        'Reading the $label from the router failed '
+        '${result.exitCode == null ? 'without an exit status' : '(exit ${result.exitCode})'}'
+        '${detail.isEmpty ? '.' : ': $detail'}',
+      );
+    }
+    return result.stdout;
   }
 
   /// Issues the flash. Deliberately returns nothing useful: a successful
@@ -627,77 +740,157 @@ class SSHService {
     // started looks like. The outcome is decided by waitForBoot.
   }
 
-  /// Waits for the router to come back and re-reads its identity. This is the
-  /// only evidence that a flash worked.
+  /// A value that changes on every boot, from
+  /// `/proc/sys/kernel/random/boot_id`. Null when the kernel does not expose
+  /// it, in which case a restart cannot be proven and is not required.
+  Future<String?> bootId() async {
+    try {
+      final result = await exec('cat /proc/sys/kernel/random/boot_id');
+      if (!result.executed || !result.succeeded) return null;
+      final id = result.output.trim();
+      return id.isEmpty ? null : id;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Waits, with a time limit, for the router to come back and re-reads its
+  /// identity. This is the only evidence that a flash really worked.
+  ///
+  /// Every host in [hosts] is probed each cycle, because erasing the
+  /// configuration usually moves the router to its stock address. A session is
+  /// only accepted when it reports [expectedBoard] (when given).
+  ///
+  /// [previousBootId] is the boot id read before `sysupgrade` was issued. When
+  /// the router still reports it, the old system is answering while the image
+  /// is being written, so that session is not a confirmation.
   ///
   /// [passwords] are tried in order on each attempt: a flash that erased the
   /// configuration leaves stock OpenWrt with no root password at all.
+  ///
+  /// [shouldStop] is polled between attempts so the user can stop waiting
+  /// without treating the flash as failed.
   Future<RouterInfo> waitForBoot({
-    required String host,
+    required List<String> hosts,
     required String username,
     required List<String> passwords,
-    Duration timeout = const Duration(minutes: 6),
+    String? expectedBoard,
+    String? previousBootId,
+    bool Function()? shouldStop,
+    Duration timeout = const Duration(minutes: 3),
     void Function(String status)? onStatus,
   }) async {
     final deadline = DateTime.now().add(timeout);
-    var reachable = false;
-
-    while (DateTime.now().isBefore(deadline)) {
-      Socket? probe;
-      try {
-        probe = await Socket.connect(host, 22, timeout: const Duration(seconds: 3));
-        reachable = true;
-      } catch (_) {
-        await Future<void>.delayed(const Duration(seconds: 3));
-      } finally {
-        probe?.destroy();
-      }
-      if (reachable) break;
-    }
-    if (!reachable) {
-      throw SSHOperationException(
-        'The router did not accept SSH connections again within '
-        '${timeout.inMinutes} minutes. It may still be booting, or the flash '
-        'may have failed. Check the router before retrying.',
-      );
-    }
-    onStatus?.call('Router is back online, confirming the new firmware...');
-
-    // First boot can migrate configuration and restart services.
     Object? lastError;
-    await Future<void>.delayed(const Duration(seconds: 5));
+    var sawOpenPort = false;
+    var settled = false;
+
+    bool stopped() => shouldStop?.call() ?? false;
+
     while (DateTime.now().isBefore(deadline)) {
-      for (final password in passwords) {
-        try {
-          await connect(host, username, password);
-          return await identify(host);
-        } catch (error) {
-          lastError = error;
-          await disconnect();
+      if (stopped()) {
+        throw const SSHOperationException(
+          'You stopped waiting before the router confirmed the flash.',
+        );
+      }
+      final reachable = await _reachableHosts(hosts);
+      if (reachable.isEmpty) {
+        await Future<void>.delayed(const Duration(seconds: 3));
+        continue;
+      }
+      sawOpenPort = true;
+      if (!settled) {
+        // First boot can restart dropbear; give it a moment before a session.
+        onStatus?.call('Router is back online, confirming the new firmware...');
+        await Future<void>.delayed(const Duration(seconds: 5));
+        settled = true;
+        if (stopped()) {
+          throw const SSHOperationException(
+            'You stopped waiting before the router confirmed the flash.',
+          );
         }
       }
-      await Future<void>.delayed(const Duration(seconds: 8));
+      for (final host in reachable) {
+        for (final password in passwords) {
+          if (stopped()) {
+            throw const SSHOperationException(
+              'You stopped waiting before the router confirmed the flash.',
+            );
+          }
+          try {
+            await connect(host, username, password);
+            final info = await identify(host);
+            if (expectedBoard == null || info.boardName == expectedBoard) {
+              // A device that still runs the pre-flash boot is the old system
+              // answering while sysupgrade writes the image. Confirming it
+              // would report success before anything has restarted.
+              if (previousBootId != null) {
+                final currentBootId = await bootId();
+                if (currentBootId != null && currentBootId == previousBootId) {
+                  lastError = SSHOperationException(
+                    'The router at $host has not restarted since the flash was '
+                    'issued.',
+                  );
+                  await disconnect();
+                  break;
+                }
+              }
+              return info;
+            }
+            lastError = SSHOperationException(
+              'The device at $host reports board "${info.boardName}".',
+            );
+            await disconnect();
+          } catch (error) {
+            lastError = error;
+            await disconnect();
+          }
+        }
+      }
+      onStatus?.call('Waiting for the router to finish booting...');
+      await Future<void>.delayed(const Duration(seconds: 5));
+    }
+
+    if (!sawOpenPort) {
+      throw SSHOperationException(
+        'The router did not accept SSH connections on '
+        '${hosts.join(', ')} within ${timeout.inMinutes} minutes. It may still '
+        'be booting, or the flash may have failed. Check the router before '
+        'retrying.',
+      );
     }
     throw SSHOperationException(
-      'The router answered on port 22 but never completed an SSH session, so '
-      'the firmware could not be confirmed: $lastError',
+      'The router answered on port 22 but a session could not be confirmed'
+      '${expectedBoard == null ? '' : ' as "$expectedBoard"'} within '
+      '${timeout.inMinutes} minutes: $lastError',
     );
+  }
+
+  /// Probes port 22 on every host concurrently and returns the reachable ones.
+  Future<List<String>> _reachableHosts(List<String> hosts) async {
+    final results = await Future.wait(
+      hosts.map((host) async {
+        Socket? probe;
+        try {
+          probe = await Socket.connect(
+            host,
+            22,
+            timeout: const Duration(seconds: 3),
+          );
+          return host;
+        } catch (_) {
+          return null;
+        } finally {
+          probe?.destroy();
+        }
+      }),
+    );
+    return [for (final host in results) ?host];
   }
 
   Future<void> disconnect() async {
     _cancelIdleWatchdog();
-    final writer = _activeWriter;
-    _activeWriter = null;
-    if (writer != null) {
-      try {
-        await writer.abort().timeout(const Duration(seconds: 3));
-      } catch (_) {}
-    }
-    final sftp = _sftp;
-    _sftp = null;
-    try {
-      if (sftp != null) await sftp.close();
-    } catch (_) {}
+    _abortActiveUpload();
     final client = _client;
     _client = null;
     try {

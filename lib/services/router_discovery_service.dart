@@ -2,8 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:network_info_plus/network_info_plus.dart';
-
 import '../models/router_info.dart';
 
 /// The subnet the PC is currently attached to.
@@ -12,6 +10,7 @@ class LocalNetwork {
     required this.localIp,
     required this.prefixLength,
     required this.source,
+    this.isWireless = false,
   });
 
   final String localIp;
@@ -19,6 +18,10 @@ class LocalNetwork {
 
   /// Where the answer came from, for display when it is a guess.
   final String source;
+
+  /// True when the only usable interface is Wi-Fi. Flashing is expected over an
+  /// Ethernet cable, so this is surfaced before anything is written.
+  final bool isWireless;
 
   List<int> get _octets => localIp.split('.').map(int.parse).toList();
 
@@ -78,27 +81,105 @@ class RouterDiscoveryService {
   static const scanConcurrency = 24;
   static const defaultPrefixLength = 24;
 
-  final NetworkInfo _networkInfo = NetworkInfo();
-
-  /// Determines the local IPv4 address and, when the OS tells us, its prefix.
+  /// Determines the IPv4 address of the wired LAN interface the router is on.
+  ///
+  /// Wi-Fi is deliberately not consulted. The router is expected on an Ethernet
+  /// cable, and the Wi-Fi address usually belongs to a different subnet and a
+  /// different router, which is why discovery used to point at the wrong place.
+  ///
+  /// dart:io does not expose netmasks, so the stock OpenWrt /24 is assumed.
   Future<LocalNetwork?> localNetwork() async {
-    String? ip;
-    String? mask;
-    var source = 'Wi-Fi interface';
+    final candidates = await _siteLocalIPv4s();
+    if (candidates.isEmpty) return null;
+    final wifiDevices = await _wifiDeviceNames();
+
+    bool wireless(String name) =>
+        _looksWireless(name) || wifiDevices.contains(name);
+
+    final physical = candidates.where((c) => !_isVirtual(c.name)).toList();
+    final wired = physical.where((c) => !wireless(c.name)).toList();
+    final chosen = wired.isNotEmpty
+        ? wired.first
+        : (physical.isNotEmpty ? physical.first : candidates.first);
+    final onWifi = wireless(chosen.name);
+    return LocalNetwork(
+      localIp: chosen.ip,
+      prefixLength: defaultPrefixLength,
+      source: onWifi ? 'Wi-Fi (${chosen.name})' : 'Ethernet (${chosen.name})',
+      isWireless: onWifi,
+    );
+  }
+
+  Future<List<({String name, String ip})>> _siteLocalIPv4s() async {
+    final result = <({String name, String ip})>[];
     try {
-      ip = await _networkInfo.getWifiIP();
-      mask = await _networkInfo.getWifiSubmask();
+      final interfaces = await NetworkInterface.list(
+        type: InternetAddressType.IPv4,
+        includeLoopback: false,
+      );
+      for (final interface in interfaces) {
+        for (final address in interface.addresses) {
+          final value = address.address;
+          if (isIPv4(value) && !_isLinkLocal(value)) {
+            result.add((name: interface.name, ip: value));
+          }
+        }
+      }
+    } catch (_) {}
+    return result;
+  }
+
+  /// macOS names both media `en0`/`en5`, so the hardware port list is the only
+  /// way to tell Wi-Fi from Ethernet there.
+  Future<Set<String>> _wifiDeviceNames() async {
+    if (!Platform.isMacOS) return const {};
+    try {
+      final result = await Process.run(
+        '/usr/sbin/networksetup',
+        const ['-listallhardwareports'],
+      );
+      if (result.exitCode != 0) return const {};
+      final devices = <String>{};
+      var inWifiPort = false;
+      for (final line in '${result.stdout}'.split('\n')) {
+        final trimmed = line.trim();
+        if (trimmed.startsWith('Hardware Port:')) {
+          inWifiPort = trimmed.toLowerCase().contains('wi-fi');
+        } else if (inWifiPort && trimmed.startsWith('Device:')) {
+          devices.add(trimmed.substring('Device:'.length).trim());
+          inWifiPort = false;
+        }
+      }
+      return devices;
     } catch (_) {
-      // Not every desktop platform can answer the Wi-Fi query; fall through.
+      return const {};
     }
-    if (ip == null || !isIPv4(ip)) {
-      final fallback = await _firstSiteLocalIPv4();
-      if (fallback == null) return null;
-      ip = fallback;
-      source = 'default interface (no Wi-Fi information available)';
-    }
-    final prefix = prefixFromMask(mask) ?? defaultPrefixLength;
-    return LocalNetwork(localIp: ip, prefixLength: prefix, source: source);
+  }
+
+  static bool _looksWireless(String name) {
+    final n = name.toLowerCase();
+    return n.contains('wi-fi') ||
+        n.contains('wifi') ||
+        n.contains('wireless') ||
+        n.contains('wlan') ||
+        n.startsWith('wl');
+  }
+
+  /// Tunnels, bridges and container interfaces are never the router's LAN.
+  static bool _isVirtual(String name) {
+    final n = name.toLowerCase();
+    return n.startsWith('utun') ||
+        n.startsWith('awdl') ||
+        n.startsWith('llw') ||
+        n.startsWith('bridge') ||
+        n.startsWith('vmnet') ||
+        n.startsWith('docker') ||
+        n.startsWith('veth') ||
+        n.startsWith('virbr') ||
+        n.startsWith('tailscale') ||
+        n.startsWith('tun') ||
+        n.startsWith('tap') ||
+        n.startsWith('zt');
   }
 
   static bool isIPv4(String value) {
@@ -108,6 +189,22 @@ class RouterDiscoveryService {
       final n = int.tryParse(part);
       return n != null && n >= 0 && n <= 255;
     });
+  }
+
+  /// The addresses a router may answer on after a flash. The pre-flash address
+  /// comes first; erasing the configuration usually returns OpenWrt to its
+  /// stock address, which need not be the one it had before.
+  static List<String> rebootHosts(String originalIp) {
+    final hosts = <String>[originalIp];
+    for (final candidate in const [
+      '192.168.1.1',
+      '10.0.0.1',
+      '192.168.0.1',
+      '192.168.8.1',
+    ]) {
+      if (!hosts.contains(candidate)) hosts.add(candidate);
+    }
+    return hosts;
   }
 
   static int? prefixFromMask(String? mask) {
@@ -131,22 +228,6 @@ class RouterDiscoveryService {
       }
     }
     return bits == 0 ? null : bits;
-  }
-
-  Future<String?> _firstSiteLocalIPv4() async {
-    try {
-      final interfaces = await NetworkInterface.list(
-        type: InternetAddressType.IPv4,
-        includeLoopback: false,
-      );
-      for (final interface in interfaces) {
-        for (final address in interface.addresses) {
-          final value = address.address;
-          if (isIPv4(value) && !_isLinkLocal(value)) return value;
-        }
-      }
-    } catch (_) {}
-    return null;
   }
 
   static bool _isLinkLocal(String ip) => ip.startsWith('169.254.');
@@ -176,9 +257,14 @@ class RouterDiscoveryService {
       network: network,
       candidates: found,
       warning: found.isEmpty
-          ? 'Nothing answered on the usual gateway addresses of $base.0/'
-              '${network.prefixLength}. You can scan the whole subnet, or type '
-              'the router address in by hand.'
+          ? (network.isWireless
+              ? 'This computer is connected over Wi-Fi ($base.0/'
+                  '${network.prefixLength}). Plug the router into an Ethernet '
+                  'port and search again — flashing over Wi-Fi is not '
+                  'supported.'
+              : 'Nothing answered on the usual gateway addresses of $base.0/'
+                  '${network.prefixLength}. You can scan the whole subnet, or '
+                  'type the router address in by hand.')
           : null,
     );
   }
@@ -196,6 +282,15 @@ class RouterDiscoveryService {
         network: null,
         candidates: [],
         warning: 'Could not determine this computer\'s IPv4 address.',
+      );
+    }
+    if (network.isWireless) {
+      return DiscoveryOutcome(
+        network: network,
+        candidates: [],
+        warning: 'This computer is connected over Wi-Fi. Connect the router '
+            'with an Ethernet cable and search again — sweeping or flashing '
+            'over Wi-Fi is not supported.',
       );
     }
     if (network.isWiderThanClassC) {

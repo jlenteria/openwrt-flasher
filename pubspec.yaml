@@ -37,9 +37,6 @@ dependencies:
   
   # SSH/SFTP for OpenWrt connection
   dartssh2: ^2.12.0
-  
-  # Network discovery
-  network_info_plus: ^6.1.1
 
   # File picking
   file_picker: ^8.1.4

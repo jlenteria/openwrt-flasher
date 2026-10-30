@@ -5,16 +5,27 @@ import 'package:shelf_static/shelf_static.dart';
 
 class HttpServerService {
   HttpServer? _server;
+  String? _lastError;
 
   bool get isRunning => _server != null;
   int? get port => _server?.port;
 
+  /// Why the last [start] failed, for display to the user.
+  String? get lastError => _lastError;
+
   /// Serves [directory] on every IPv4 interface. Returns the bound port, or
   /// null when the server could not start.
   Future<int?> start(String directory, {int port = 8080}) async {
+    _lastError = null;
     try {
       if (_server != null) {
         await stop();
+      }
+      final folder = Directory(directory);
+      if (!await folder.exists()) {
+        _lastError = 'The firmware folder $directory does not exist. Create '
+            'it, or choose another folder in step 4.';
+        return null;
       }
       final handler = createStaticHandler(
         directory,
@@ -24,6 +35,7 @@ class HttpServerService {
       _server = await shelf_io.serve(handler, InternetAddress.anyIPv4, port);
       return _server!.port;
     } catch (e) {
+      _lastError = '$e';
       return null;
     }
   }

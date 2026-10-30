@@ -6,7 +6,11 @@ class SerialService {
   SerialPort? _port;
   SerialPortReader? _reader;
   StreamSubscription<Uint8List>? _subscription;
-  
+  String? _lastError;
+
+  /// Why the last [connect] failed, for display to the user.
+  String? get lastError => _lastError;
+
   final _dataController = StreamController<String>.broadcast();
   Stream<String> get dataStream => _dataController.stream;
   
@@ -17,10 +21,13 @@ class SerialService {
   }
   
   Future<bool> connect(String portName, {int baudRate = 115200}) async {
+    _lastError = null;
     try {
       disconnect();
       _port = SerialPort(portName);
       if (!_port!.openReadWrite()) {
+        _lastError =
+            'the port could not be opened. Another program may be using it.';
         return false;
       }
       
@@ -42,6 +49,7 @@ class SerialService {
       });
       return true;
     } catch (e) {
+      _lastError = '$e';
       return false;
     }
   }

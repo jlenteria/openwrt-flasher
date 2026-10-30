@@ -64,8 +64,23 @@ void main() {
     // The images must actually decode, not fall back to placeholder icons.
     expect(find.byIcon(Icons.usb), findsNothing);
     expect(find.byIcon(Icons.memory), findsNothing);
-    expect(find.textContaining(RegExp('zrouter|flarewifi', caseSensitive: false)),
-        findsNothing);
+  });
+
+  testWidgets('recovery offers the default firmware downloads',
+      (tester) async {
+    tester.view.physicalSize = const Size(1000, 30000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(app());
+
+    await tester.tap(find.text('Recovery'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Download Required Firmware'), findsOneWidget);
+    expect(find.text('Default firmware (ZR-2660)'), findsOneWidget);
+    expect(find.text('Example upgrade firmware (FlareWifi)'), findsOneWidget);
+    expect(find.text('Upgrade Firmware (sysupgrade)'), findsOneWidget);
+    expect(find.widgetWithText(OutlinedButton, 'Download'), findsNWidgets(2));
   });
 
   group('the recovery guide matches the OS', () {
@@ -111,6 +126,40 @@ void main() {
         expect(text, isNot(contains(' Mac ')), skip: os == HostOs.macos);
       });
     }
+  });
+
+  testWidgets('erases the configuration unless the user opts in',
+      (tester) async {
+    await tester.pumpWidget(app());
+
+    final keepTile = find.widgetWithText(
+      SwitchListTile,
+      'Keep the router configuration',
+    );
+    await tester.dragUntilVisible(
+      keepTile,
+      find.byType(ListView).first,
+      const Offset(0, -240),
+    );
+    await tester.pumpAndSettle();
+
+    expect(
+      tester.widget<SwitchListTile>(keepTile).value,
+      isFalse,
+      reason: 'sysupgrade must run with -n by default',
+    );
+
+    final backupTile = find.widgetWithText(
+      SwitchListTile,
+      'Download a configuration backup first',
+    );
+    final backup = tester.widget<SwitchListTile>(backupTile);
+    expect(backup.value, isTrue);
+    expect(
+      backup.onChanged,
+      isNotNull,
+      reason: 'the backup is most useful when settings are erased',
+    );
   });
 
   testWidgets('advertises no drag-and-drop that is not implemented',

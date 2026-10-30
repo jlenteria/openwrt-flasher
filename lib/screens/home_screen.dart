@@ -7,6 +7,7 @@ import 'package:file_picker/file_picker.dart';
 
 import '../models/firmware_info.dart';
 import '../models/router_info.dart';
+import '../services/firmware_download_service.dart';
 import '../services/firmware_service.dart';
 import '../services/hostkey_store.dart';
 import '../services/router_discovery_service.dart';
@@ -86,6 +87,7 @@ class _HomeScreenState extends State<HomeScreen> {
   );
   final RouterDiscoveryService _discovery = RouterDiscoveryService();
   final FirmwareService _firmwareService = FirmwareService();
+  final FirmwareDownloadService _firmwareDownloads = FirmwareDownloadService();
   final SerialService _serialService = SerialService();
   final HttpServerService _httpServerService = HttpServerService();
 
@@ -104,6 +106,9 @@ class _HomeScreenState extends State<HomeScreen> {
   String _recoveryStatus = 'Not connected';
   String? _openwrtInitramfsPath;
   String? _sysupgradeImagePath;
+  bool _downloadingDefault = false;
+  String? _initramfsDownloadStatus;
+  String? _upgradeDownloadStatus;
   // Each OS's own TFTP server serves a different folder by default.
   late String _tftpDir = switch (_os) {
     HostOs.windows => r'C:\tftp',
@@ -115,6 +120,8 @@ class _HomeScreenState extends State<HomeScreen> {
   final TextEditingController _consoleInputController = TextEditingController();
   bool _httpServerRunning = false;
   String? _httpServerUrl;
+  String? _httpServerMessage;
+  bool _httpServerError = false;
 
   LocalNetwork? _network;
   List<RouterCandidate> _candidates = [];
@@ -129,7 +136,7 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _ackUnverified = false;
   bool _firmwareBusy = false;
 
-  bool _keepSettings = true;
+  bool _keepSettings = false;
   bool _backupConfig = true;
 
   List<CheckRow> _checks = [];
@@ -149,9 +156,23 @@ class _HomeScreenState extends State<HomeScreen> {
   RouterInfo? _verifiedAfter;
   String? _backupFile;
 
+  /// True once `sysupgrade` has been started. From then on the image is
+  /// written even if the router cannot be re-identified, so a confirmation
+  /// timeout is reported as "installed but unconfirmed", never as a failure.
+  bool _flashIssued = false;
+  String? _confirmationNote;
+  bool _skipConfirmation = false;
+  final TextEditingController _confirmIpController = TextEditingController();
+  bool _confirming = false;
+  String? _confirmError;
+
   /// The version the router reported before we wrote to it, for the result
   /// screen. Never a placeholder.
   String? _versionBefore;
+
+  /// The router's boot id before the flash. A confirmation that still reports
+  /// it describes the old system, not the new firmware.
+  String? _bootIdBefore;
 
   @override
   void initState() {
@@ -192,6 +213,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _passwordController.dispose();
     _usernameController.dispose();
     _manualIpController.dispose();
+    _confirmIpController.dispose();
     _consoleScrollController.dispose();
     _tftpDirController.dispose();
     _consoleInputController.dispose();
@@ -208,13 +230,23 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _connectSerial() async {
-    if (_selectedSerialPort.isEmpty) return;
+    if (_selectedSerialPort.isEmpty) {
+      _showErrorToast('Choose a serial port first.');
+      return;
+    }
     _runOnUi(() => _recoveryStatus = 'Connecting...');
     final success = await _serialService.connect(_selectedSerialPort);
     _runOnUi(() {
       _serialConnected = success;
       _recoveryStatus = success ? 'Connected to $_selectedSerialPort' : 'Failed to connect';
     });
+    if (!success) {
+      _showErrorToast(
+        'Could not open $_selectedSerialPort: '
+        '${_serialService.lastError ?? 'unknown error'}. Check that the USB '
+        'serial adapter is plugged in and not used by another program.',
+      );
+    }
   }
 
   void _disconnectSerial() {
@@ -257,6 +289,67 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> _downloadDefaultImage(DefaultFirmwareImage image) async {
+    if (_downloadingDefault) return;
+    final directory = _tftpDir;
+    _setDownloadStatus(image, 'Downloading ${image.label}...');
+    _runOnUi(() => _downloadingDefault = true);
+    var lastPercent = -1;
+    try {
+      final file = await _firmwareDownloads.downloadDefaultImage(
+        image,
+        directory,
+        onProgress: (received, total) {
+          final percent = total == null ? null : received * 100 ~/ total;
+          if (percent == lastPercent) return;
+          lastPercent = percent ?? -1;
+          _setDownloadStatus(
+            image,
+            percent == null
+                ? 'Downloading ${image.label}: ${_formatBytes(received)}'
+                : 'Downloading ${image.label}: $percent%',
+          );
+        },
+      );
+      final role = image.isUpgrade ? 'upgrade' : 'default';
+      final message = 'Saved ${_basename(file.path)} to $directory and selected '
+          'it as the $role firmware.';
+      _runOnUi(() {
+        if (image.isUpgrade) {
+          _sysupgradeImagePath = file.path;
+          _upgradeDownloadStatus = message;
+        } else {
+          _openwrtInitramfsPath = file.path;
+          _initramfsDownloadStatus = message;
+        }
+        _recoveryStatus = message;
+      });
+    } catch (e) {
+      _setDownloadStatus(image, 'Download failed: $e');
+      _showErrorToast(
+        'Could not download the ${image.label} firmware: $e If $directory is '
+        'not writable, run the command in step 1 first or pick another folder '
+        'in step 4.',
+      );
+    } finally {
+      _runOnUi(() => _downloadingDefault = false);
+    }
+  }
+
+  void _setDownloadStatus(DefaultFirmwareImage image, String message) {
+    _runOnUi(() {
+      if (image.isUpgrade) {
+        _upgradeDownloadStatus = message;
+      } else {
+        _initramfsDownloadStatus = message;
+      }
+    });
+  }
+
+  static String _formatBytes(int bytes) => bytes >= 1024 * 1024
+      ? '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB'
+      : '${(bytes / 1024).toStringAsFixed(0)} KB';
+
   Future<void> _copyToTftp() async {
     try {
       final dir = Directory(_tftpDir);
@@ -265,11 +358,15 @@ class _HomeScreenState extends State<HomeScreen> {
       }
       for (final path in [_openwrtInitramfsPath, _sysupgradeImagePath]) {
         if (path == null) continue;
-        await File(path).copy('$_tftpDir${Platform.pathSeparator}${_basename(path)}');
+        final target = '$_tftpDir${Platform.pathSeparator}${_basename(path)}';
+        // A default download already lives in this folder.
+        if (File(path).absolute.path == File(target).absolute.path) continue;
+        await File(path).copy(target);
       }
       _runOnUi(() => _recoveryStatus = 'Files copied to $_tftpDir');
     } catch (e) {
       _runOnUi(() => _recoveryStatus = 'Error copying files: $e');
+      _showErrorToast('Could not copy the files to $_tftpDir: $e');
     }
   }
 
@@ -279,17 +376,39 @@ class _HomeScreenState extends State<HomeScreen> {
       _runOnUi(() {
         _httpServerRunning = false;
         _httpServerUrl = null;
+        _httpServerError = false;
+        _httpServerMessage = 'HTTP server stopped.';
         _recoveryStatus = 'HTTP server stopped';
       });
       return;
     }
-    final port = await _httpServerService.start(_tftpDir);
-    final url = port == null ? null : 'http://192.168.1.100:$port';
+    _runOnUi(() {
+      _httpServerError = false;
+      _httpServerMessage = 'Starting the HTTP server in $_tftpDir...';
+    });
+    final directory = _tftpDir;
+    final port = await _httpServerService.start(directory);
+    final url = port == null ? null : 'http://192.168.1.2:$port';
+    final error = _httpServerService.lastError;
     _runOnUi(() {
       _httpServerRunning = url != null;
       _httpServerUrl = url;
-      _recoveryStatus = url != null ? 'HTTP server running at $url' : 'Failed to start server';
+      _httpServerError = url == null;
+      _httpServerMessage = url != null
+          ? 'HTTP server is running at $url, serving $directory.'
+          : 'Could not start the HTTP server: '
+              '${error ?? 'unknown error'}. Make sure the folder exists and '
+              'no other program is using the port.';
+      _recoveryStatus =
+          url != null ? 'HTTP server running at $url' : 'Failed to start server';
     });
+    if (url == null) {
+      _showErrorToast(
+        'Could not start the HTTP server'
+        '${error == null ? '' : ': $error'}'
+        '. Make sure the folder exists and no other program is using the port.',
+      );
+    }
   }
 
   // -------------------------------------------------------------- state rules
@@ -311,22 +430,27 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _showErrorToast(String message) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Row(
-          children: [
-            const Icon(Icons.error_outline, color: Colors.white),
-            const SizedBox(width: 12),
-            Expanded(child: Text(message)),
-          ],
+    final messenger = ScaffoldMessenger.of(context);
+    messenger
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Row(
+            children: [
+              const Icon(Icons.error_outline, color: Colors.white),
+              const SizedBox(width: 12),
+              Expanded(child: Text(message)),
+            ],
+          ),
+          backgroundColor: Theme.of(context).colorScheme.error,
+          behavior: SnackBarBehavior.floating,
+          margin: const EdgeInsets.all(16),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+          showCloseIcon: true,
+          closeIconColor: Colors.white,
+          duration: const Duration(seconds: 8),
         ),
-        backgroundColor: Theme.of(context).colorScheme.error,
-        behavior: SnackBarBehavior.floating,
-        margin: const EdgeInsets.all(16),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-        duration: const Duration(seconds: 4),
-      ),
-    );
+      );
   }
 
   static String _shortHash(String value) =>
@@ -441,6 +565,12 @@ class _HomeScreenState extends State<HomeScreen> {
       );
       if (!mounted) return;
       _applyDiscovery(outcome.network, outcome.candidates, outcome.warning ?? '');
+      if (outcome.network?.isWireless ?? false) {
+        _showErrorToast(
+          'Connect the router with an Ethernet cable to search the LAN — '
+          'sweeping over Wi-Fi is not supported.',
+        );
+      }
     } on Object catch (e) {
       _runOnUi(() {
         _discoveryBusy = false;
@@ -472,6 +602,12 @@ class _HomeScreenState extends State<HomeScreen> {
       }
     });
     _invalidateChecks();
+    if (network == null) {
+      _showErrorToast(
+        'Could not determine this computer\'s LAN address. Connect the router '
+        'with an Ethernet cable and try again.',
+      );
+    }
   }
 
   void _useManualIp() {
@@ -482,10 +618,10 @@ class _HomeScreenState extends State<HomeScreen> {
         value != '0.0.0.0' &&
         value != '255.255.255.255';
     if (!valid) {
-      _runOnUi(
-        () => _discoveryStatus = 'Enter a full IPv4 address such as '
-            '192.168.1.1.',
-      );
+      const message =
+          'Enter a full IPv4 address such as 192.168.1.1.';
+      _runOnUi(() => _discoveryStatus = message);
+      _showErrorToast(message);
       return;
     }
     _runOnUi(() {
@@ -508,6 +644,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final ip = _selectedIp;
     if (ip == null) {
       _runOnUi(() => _discoveryStatus = 'Choose or type an address first.');
+      _showErrorToast('Choose or type a router address first.');
       return;
     }
     _runOnUi(() {
@@ -535,6 +672,9 @@ class _HomeScreenState extends State<HomeScreen> {
         _discoveryBusy = false;
         _discoveryStatus = 'Cannot confirm this device: ${error.message}';
       });
+      _showErrorToast(
+        'Could not identify the router at $ip.\n${error.message}',
+      );
     } on Object catch (error) {
       await _ssh.disconnect();
       _runOnUi(() {
@@ -542,6 +682,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _discoveryBusy = false;
         _discoveryStatus = 'Cannot confirm this device: $error';
       });
+      _showErrorToast('Could not identify the router at $ip: $error');
     }
   }
 
@@ -565,11 +706,17 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _pickFirmware() async {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: const ['bin', 'img'],
-      withData: false,
-    );
+    FilePickerResult? result;
+    try {
+      result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: const ['bin', 'img'],
+        withData: false,
+      );
+    } on Object catch (error) {
+      _showErrorToast('Could not open the file picker: $error');
+      return;
+    }
     final path = result?.files.single.path;
     if (path == null) return;
     _runOnUi(() {
@@ -623,6 +770,7 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ];
       });
+      _showErrorToast('Identify the router and choose an image first.');
       return;
     }
 
@@ -660,6 +808,10 @@ class _HomeScreenState extends State<HomeScreen> {
       ));
       if (!sameBoard) {
         _finishPreflight(rows, ok: false);
+        _showErrorToast(
+          'The router at ${router.ip} now reports "${live.boardName}", not '
+          '"${router.boardName}". Nothing was flashed.',
+        );
         return;
       }
       _versionBefore = live.firmwareVersion;
@@ -701,6 +853,27 @@ class _HomeScreenState extends State<HomeScreen> {
         hash.isEmpty ? 'Could not hash the file.' : hash,
       ));
 
+      final network = _network;
+      rows.add(
+        network == null
+            ? const CheckRow(
+                'Wired connection',
+                CheckOutcome.warning,
+                'Could not confirm a wired LAN interface. Connect the router '
+                'with an Ethernet cable before flashing.',
+              )
+            : CheckRow(
+                'Wired connection',
+                network.isWireless
+                    ? CheckOutcome.warning
+                    : CheckOutcome.passed,
+                network.isWireless
+                    ? 'This computer is on Wi-Fi. Connect the router with an '
+                        'Ethernet cable before flashing.'
+                    : 'Using ${network.source} at ${network.localIp}.',
+              ),
+      );
+
       if (!mounted) return;
       _finishPreflight(
         rows,
@@ -709,9 +882,11 @@ class _HomeScreenState extends State<HomeScreen> {
     } on SSHOperationException catch (error) {
       rows.add(CheckRow('Check aborted', CheckOutcome.failed, error.message));
       _finishPreflight(rows, ok: false);
+      _showErrorToast('Safety checks could not finish. ${error.message}');
     } on Object catch (error) {
       rows.add(CheckRow('Check aborted', CheckOutcome.failed, '$error'));
       _finishPreflight(rows, ok: false);
+      _showErrorToast('Safety checks could not finish: $error');
     } finally {
       await _ssh.disconnect();
     }
@@ -762,6 +937,13 @@ class _HomeScreenState extends State<HomeScreen> {
       _flashError = null;
       _verifiedAfter = null;
       _backupFile = null;
+      _flashIssued = false;
+      _confirmationNote = null;
+      _skipConfirmation = false;
+      _confirming = false;
+      _confirmError = null;
+      _confirmIpController.clear();
+      _bootIdBefore = null;
       _progress = 0;
       _step = FlashStep.connect;
       _status = 'Connecting to ${router.ip}...';
@@ -782,6 +964,7 @@ class _HomeScreenState extends State<HomeScreen> {
         );
       }
       _versionBefore ??= live.firmwareVersion;
+      _bootIdBefore = await _ssh.bootId();
 
       _setStep(FlashStep.upload, 'Uploading firmware — do not interrupt.');
       await _ssh.uploadFirmware(path, SSHService.remoteFirmwarePath, (value) {
@@ -827,55 +1010,146 @@ class _HomeScreenState extends State<HomeScreen> {
         SSHService.remoteFirmwarePath,
         keepSettings: _keepSettings,
       );
+      // The image is being written from here on: a failed confirmation below
+      // is not a failed flash.
+      _runOnUi(() => _flashIssued = true);
 
       _setStep(FlashStep.rebootWait, 'Waiting for the router to reboot...');
       await _ssh.disconnect();
       final after = await _ssh.waitForBoot(
-        host: router.ip,
+        hosts: RouterDiscoveryService.rebootHosts(router.ip),
         username: _usernameController.text,
         passwords: [
           _passwordController.text,
           // Erasing the configuration also erases the root password.
           if (!_keepSettings && _passwordController.text.isNotEmpty) '',
         ],
+        expectedBoard: router.boardName,
+        previousBootId: _bootIdBefore,
+        shouldStop: () => _skipConfirmation,
+        timeout: const Duration(minutes: 3),
         onStatus: (message) => _setStep(FlashStep.rebootWait, message),
       );
 
-      if (after.boardName != router.boardName) {
-        throw SSHOperationException(
-          'The router came back reporting "${after.boardName}" instead of '
-          '"${router.boardName}". Treat this as an unfinished flash.',
-        );
-      }
       _runOnUi(() {
         if (_flowAbandoned) return;
         _verifiedAfter = after;
         _router = after;
+        _selectedIp = after.ip;
+        _confirmationNote = null;
         _step = FlashStep.idle;
         _status = 'Verified.';
       });
     } on SSHOperationException catch (error) {
-      _flashErrorOnUi(error.message);
+      _flashFailureOrNote(error.message);
     } on Object catch (error) {
-      _flashErrorOnUi('$error');
+      _flashFailureOrNote('$error');
     } finally {
       await _ssh.disconnect();
       if (!_flowAbandoned) _runOnUi(() => _flashing = false);
     }
   }
 
-  void _flashErrorOnUi(String message) {
+  /// Failures before `sysupgrade` starts are errors. Once the image is being
+  /// written, the router simply could not be confirmed in time, so the result
+  /// page reports success with a note instead.
+  void _flashFailureOrNote(String message) {
     if (_flowAbandoned) return;
+    if (_flashIssued) {
+      _runOnUi(() {
+        _flashError = null;
+        _confirmationNote = message;
+        _step = FlashStep.idle;
+        _status = '';
+      });
+      return;
+    }
     _runOnUi(() => _flashError = message);
+    _showErrorToast('Flashing failed. $message');
+  }
+
+  /// Rechecks a router at an address the user typed in. Only a board-name
+  /// match is accepted, so this never confirms some other device.
+  Future<void> _confirmFirmware() async {
+    final router = _router;
+    if (router == null) return;
+    final ip = _confirmIpController.text.trim();
+    if (!RouterDiscoveryService.isIPv4(ip)) {
+      const message = 'Enter a full IPv4 address, like 192.168.1.1.';
+      _runOnUi(() => _confirmError = message);
+      _showErrorToast(message);
+      return;
+    }
+    _runOnUi(() {
+      _confirming = true;
+      _confirmError = null;
+    });
+    try {
+      final passwords = <String>[
+        _passwordController.text,
+        if (!_keepSettings && _passwordController.text.isNotEmpty) '',
+      ];
+      RouterInfo? info;
+      Object? lastError;
+      for (final password in passwords) {
+        try {
+          await _ssh.connect(ip, _usernameController.text, password);
+          info = await _ssh.identify(ip);
+          break;
+        } catch (error) {
+          lastError = error;
+          await _ssh.disconnect();
+        }
+      }
+      if (info == null) {
+        throw SSHOperationException(
+          'Could not sign in to $ip. Is the router there, and is SSH open? '
+          'Last error: $lastError',
+        );
+      }
+      if (info.boardName != router.boardName) {
+        throw SSHOperationException(
+          '"$ip" reports board "${info.boardName}", not "${router.boardName}". '
+          'This is not the router that was flashed.',
+        );
+      }
+      final previousBootId = _bootIdBefore;
+      if (previousBootId != null) {
+        final currentBootId = await _ssh.bootId();
+        if (currentBootId != null && currentBootId == previousBootId) {
+          throw const SSHOperationException(
+            'The router is still running the boot it had before the flash, so '
+            'the new firmware has not started. Do not treat this as confirmed.',
+          );
+        }
+      }
+      final confirmed = info;
+      _runOnUi(() {
+        _verifiedAfter = confirmed;
+        _router = confirmed;
+        _selectedIp = ip;
+        _flashError = null;
+        _confirmationNote = null;
+      });
+    } on SSHOperationException catch (error) {
+      _runOnUi(() => _confirmError = error.message);
+      _showErrorToast('Could not confirm the firmware. ${error.message}');
+    } on Object catch (error) {
+      _runOnUi(() => _confirmError = '$error');
+      _showErrorToast('Could not confirm the firmware: $error');
+    } finally {
+      await _ssh.disconnect();
+      _runOnUi(() => _confirming = false);
+    }
   }
 
   Future<void> _saveConfigBackup() async {
     try {
       final bytes = await _ssh.createConfigBackup();
       if (bytes == null) {
-        _runOnUi(
-          () => _backupFile = 'This device would not produce a backup.',
-        );
+        const message = 'The router did not produce a configuration backup.';
+        _runOnUi(() => _backupFile = message);
+        _showErrorToast(message);
         return;
       }
       final suggested =
@@ -897,6 +1171,12 @@ class _HomeScreenState extends State<HomeScreen> {
       _runOnUi(() => _backupFile = target);
     } on SSHOperationException catch (error) {
       _runOnUi(() => _backupFile = 'Backup failed: ${error.message}');
+      _showErrorToast('Could not save the configuration backup. '
+          '${error.message}');
+    } on Object catch (error) {
+      _runOnUi(() => _backupFile = 'Backup failed: $error');
+      _showErrorToast('Could not save the configuration backup: $error');
+      rethrow;
     }
   }
 
@@ -927,7 +1207,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     if (_flashing) return _buildFlashScreen(theme);
-    if (_verifiedAfter != null || _flashError != null) {
+    if (_verifiedAfter != null || _flashError != null || _flashIssued) {
       return _buildResultScreen(theme);
     }
 
@@ -1023,10 +1303,10 @@ class _HomeScreenState extends State<HomeScreen> {
 
   String get _staticIpCommand => switch (_os) {
         HostOs.windows => 'netsh interface ip set address name="Ethernet" '
-            'static 192.168.1.100 255.255.255.0',
+            'static 192.168.1.2 255.255.255.0',
         HostOs.macos =>
-          'sudo ifconfig en5 192.168.1.100 netmask 255.255.255.0',
-        HostOs.linux => 'sudo ip addr add 192.168.1.100/24 dev eth0',
+          'sudo ifconfig en5 192.168.1.2 netmask 255.255.255.0',
+        HostOs.linux => 'sudo ip addr add 192.168.1.2/24 dev eth0',
       };
 
   String get _showIpCommand => switch (_os) {
@@ -1041,7 +1321,7 @@ class _HomeScreenState extends State<HomeScreen> {
       ? 'openwrt-sysupgrade.bin'
       : _basename(_sysupgradeImagePath!);
 
-  String get _serverBase => _httpServerUrl ?? 'http://192.168.1.100:8080';
+  String get _serverBase => _httpServerUrl ?? 'http://192.168.1.2:8080';
 
   String get _wgetCommands => 'cd /tmp\n'
       'wget $_serverBase/$_firmwareName\n'
@@ -1077,7 +1357,7 @@ class _HomeScreenState extends State<HomeScreen> {
             _bootOpenWrtCard(theme),
             if (!wide) ...[
               const SizedBox(height: 16),
-              _consolePanel(theme, height: 360),
+              _consolePanel(theme, height: 480),
             ],
             const SizedBox(height: 24),
             _header(theme, 'Install OpenWrt Firmware'),
@@ -1097,7 +1377,7 @@ class _HomeScreenState extends State<HomeScreen> {
           children: [
             Expanded(child: guide),
             SizedBox(
-              width: 480,
+              width: (constraints.maxWidth * 0.45).clamp(480.0, 1000.0),
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(0, 24, 24, 24),
                 child: _consolePanel(theme),
@@ -1122,14 +1402,14 @@ class _HomeScreenState extends State<HomeScreen> {
         HostOs.windows => [
             _guideStep(theme, 1, 'Install Required Software', [
               _guideText(theme,
-                  'Install the USB-to-Serial driver for your adapter (CH340, CP2102, '
+                  'Install the USB to TTL driver for your adapter (CH340, CP2102, '
                   'FT232, etc.) if Windows does not recognize it automatically.'),
               const SizedBox(height: 6),
               _guideText(theme,
                   'Install a TFTP server such as Tftpd64, set its base directory to '
-                  'the firmware folder in step 4, and select your Ethernet adapter as '
-                  'the server interface. The bootloader downloads the initramfs '
-                  'image from it.'),
+                  'the firmware folder in step 4, and select 192.168.1.2 (your '
+                  'Ethernet adapter, after step 6) as the server interface. The '
+                  'bootloader downloads the initramfs image from it.'),
               _guideCode(theme, 'https://pjo2.github.io/tftpd64/'),
               _guideText(theme,
                   'Nothing else is needed: this app includes the serial console '
@@ -1137,8 +1417,8 @@ class _HomeScreenState extends State<HomeScreen> {
             ]),
             _guideStep(theme, 2, 'Find the COM Port', [
               _guideText(theme,
-                  'Open Device Manager and expand Ports (COM & LPT). '
-                  'Example: USB-SERIAL CH340 (COM4).'),
+                  'Plug in the USB to TTL adapter, open Device Manager and expand '
+                  'Ports (COM & LPT). Example: USB-SERIAL CH340 (COM4).'),
               detectedPorts,
             ]),
           ],
@@ -1153,7 +1433,7 @@ class _HomeScreenState extends State<HomeScreen> {
               _guideText(theme, 'Optional: a TFTP client to test the server:'),
               _guideCode(theme, 'brew install tftp-hpa'),
             ]),
-            _guideStep(theme, 2, 'Find the USB Serial Port', [
+            _guideStep(theme, 2, 'Find the USB to TTL Port', [
               _guideCode(theme, _listSerialCommand),
               _guideText(theme, 'Example: $_serialExample'),
               detectedPorts,
@@ -1168,7 +1448,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   'sudo apt install tftpd-hpa\n'
                   'sudo chown \$USER /srv/tftp'),
             ]),
-            _guideStep(theme, 2, 'Find the USB Serial Port', [
+            _guideStep(theme, 2, 'Find the USB to TTL Port', [
               _guideCode(theme, _listSerialCommand),
               _guideText(theme, 'Example: $_serialExample'),
               _guideText(theme,
@@ -1180,30 +1460,57 @@ class _HomeScreenState extends State<HomeScreen> {
           ],
       },
       _guideStep(theme, 3, 'Download Required Firmware', [
-        _guideLabel(theme, 'OpenWrt Initramfs'),
+        _guideLabel(theme, 'Default Firmware (initramfs)'),
         _guideText(theme,
-            'Download the initramfs image (…-initramfs-kernel.bin) for your exact '
-            'board and hardware revision from:'),
+            'If you have not downloaded firmware yet, use the default. It is '
+            'saved to the firmware folder and selected as the initramfs image, '
+            'ready for the TFTP boot below.'),
+        const SizedBox(height: 4),
+        for (final image in FirmwareDownloadService.defaultFirmwareImages) ...[
+          _defaultFirmwareRow(theme, image),
+          const SizedBox(height: 6),
+        ],
+        if (_initramfsDownloadStatus != null) ...[
+          _guideText(theme, _initramfsDownloadStatus!),
+          const SizedBox(height: 4),
+        ],
+        _guideText(theme,
+            'The default firmware boots OpenWrt from RAM and is not permanent.'),
+        const SizedBox(height: 6),
+        _guideText(theme,
+            'Or download the initramfs image (…-initramfs-kernel.bin) for your '
+            'exact board and hardware revision from:'),
         _guideCode(theme, _firmwareSelectorLink),
-        _guideLabel(theme, 'OpenWrt Sysupgrade Firmware'),
-        _guideText(theme,
-            'From the same page, download the sysupgrade image '
-            '(…-squashfs-sysupgrade.bin). Board details are in the Table of Hardware:'),
-        _guideCode(theme, _tableOfHardwareLink),
         const SizedBox(height: 4),
         _filePickRow(
           theme,
           _openwrtInitramfsPath,
-          'No OpenWrt Initramfs selected',
-          'Select Initramfs',
+          'No default firmware (initramfs) selected',
+          'Select Default',
           _pickOpenWrtInitramfs,
         ),
-        const SizedBox(height: 8),
+        const SizedBox(height: 14),
+        _guideLabel(theme, 'Upgrade Firmware (sysupgrade)'),
+        _guideText(theme,
+            'The upgrade image is installed permanently and must match the same '
+            'board. Download the example, or the matching sysupgrade image '
+            '(…-squashfs-sysupgrade.bin) from:'),
+        const SizedBox(height: 4),
+        for (final image in FirmwareDownloadService.upgradeFirmwareImages) ...[
+          _defaultFirmwareRow(theme, image),
+          const SizedBox(height: 6),
+        ],
+        if (_upgradeDownloadStatus != null) ...[
+          _guideText(theme, _upgradeDownloadStatus!),
+          const SizedBox(height: 4),
+        ],
+        _guideCode(theme, _tableOfHardwareLink),
+        const SizedBox(height: 4),
         _filePickRow(
           theme,
           _sysupgradeImagePath,
-          'No sysupgrade firmware selected',
-          'Select Sysupgrade',
+          'No upgrade firmware (sysupgrade) selected',
+          'Select Upgrade',
           _pickSysupgradeImage,
         ),
       ]),
@@ -1242,12 +1549,15 @@ class _HomeScreenState extends State<HomeScreen> {
             'LAN ports of the OpenWrt board.'),
       ]),
       _guideStep(theme, 6, 'Configure a Static IP Address', [
+        _guideText(theme,
+            'Use 192.168.1.2: it is the TFTP server address U-Boot uses by default.'),
+        const SizedBox(height: 6),
         if (_isWindows) ...[
           _guideText(theme,
               'Open Control Panel → Network and Sharing Center → Change adapter settings, '
               'then open your Ethernet adapter properties (IPv4) and set:'),
           const SizedBox(height: 4),
-          _kv(theme, 'IP Address', '192.168.1.100'),
+          _kv(theme, 'IP Address', '192.168.1.2'),
           _kv(theme, 'Subnet Mask', '255.255.255.0'),
           _kv(theme, 'Default Gateway', 'Leave blank'),
           const SizedBox(height: 6),
@@ -1287,7 +1597,7 @@ class _HomeScreenState extends State<HomeScreen> {
           children: [
             Text('Required Hardware', style: theme.textTheme.titleSmall),
             const SizedBox(height: 6),
-            _guideBullet(theme, 'USB-to-Serial Adapter (CH340G, CP2102, FT232, etc.)'),
+            _guideBullet(theme, 'USB to TTL Adapter (CH340G, CP2102, FT232, etc.)'),
             _guideBullet(theme, 'UART Jumper Wires'),
             const SizedBox(height: 16),
             Text('Wiring', style: theme.textTheme.titleSmall),
@@ -1297,9 +1607,9 @@ class _HomeScreenState extends State<HomeScreen> {
                 Expanded(
                   child: _hardwareImage(
                     theme,
-                    'assets/images/usb_serial_adapter.png',
+                    'assets/images/usb_ttl_adapter.png',
                     Icons.usb,
-                    'USB Serial Adapter',
+                    'USB to TTL',
                   ),
                 ),
                 const SizedBox(width: 12),
@@ -1317,9 +1627,9 @@ class _HomeScreenState extends State<HomeScreen> {
             Table(
               border: TableBorder.all(color: theme.colorScheme.outlineVariant),
               children: [
-                _wiringRow(theme, 'USB Serial Adapter', 'Board UART', header: true),
-                _wiringRow(theme, 'TX', 'RX'),
-                _wiringRow(theme, 'RX', 'TX'),
+                _wiringRow(theme, 'USB to TTL', 'Board UART', header: true),
+                _wiringRow(theme, 'TX', 'TX'),
+                _wiringRow(theme, 'RX', 'RX'),
                 _wiringRow(theme, 'GND', 'GND'),
               ],
             ),
@@ -1416,13 +1726,24 @@ class _HomeScreenState extends State<HomeScreen> {
         _guideText(theme,
             'Select 4. Load image and choose the OpenWrt Initramfs firmware '
             '(${_openwrtInitramfsPath == null ? 'not selected yet' : _basename(_openwrtInitramfsPath!)}) '
-            'located in ${_tftpDirController.text}. Use 192.168.1.100 as the '
-            'TFTP server IP if the bootloader asks.'),
+            'located in ${_tftpDirController.text}.'),
         const SizedBox(height: 8),
         FilledButton.tonalIcon(
           onPressed: _serialConnected ? () => _sendSerial('4\n') : null,
           icon: const Icon(Icons.download),
           label: const Text('Send "4. Load image"'),
+        ),
+        const SizedBox(height: 8),
+        _guideText(theme,
+            'The bootloader then asks for the device IP, the TFTP server IP '
+            '(192.168.1.2) and the file name. Press Enter at each prompt to keep '
+            'the default values, using the console\'s Enter button or the Enter key. '
+            'Only type the initramfs file name if the default does not match it.'),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+          onPressed: _serialConnected ? () => _sendSerial('\n') : null,
+          icon: const Icon(Icons.keyboard_return),
+          label: const Text('Send Enter'),
         ),
         const SizedBox(height: 8),
         _guideText(theme, 'The router will boot into a temporary OpenWrt environment.'),
@@ -1458,16 +1779,25 @@ class _HomeScreenState extends State<HomeScreen> {
               icon: Icon(_httpServerRunning ? Icons.stop : Icons.play_arrow),
               label: Text(_httpServerRunning ? 'Stop HTTP Server' : 'Start HTTP Server'),
             ),
-            const SizedBox(width: 12),
-            if (_httpServerUrl != null)
-              Expanded(
-                child: Text(
-                  'Serving HTTP at $_httpServerUrl',
-                  style: theme.textTheme.bodySmall,
-                ),
-              ),
           ],
         ),
+        if (_httpServerMessage != null) ...[
+          const SizedBox(height: 8),
+          _serverStatusLine(
+            theme,
+            _httpServerMessage!,
+            error: _httpServerError,
+            active: _httpServerRunning,
+          ),
+        ],
+        if (_isWindows)
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: _guideText(theme,
+                'The first time it starts, Windows may ask for firewall access. '
+                'Allow this app for private networks, or the router cannot '
+                'download the firmware from it.'),
+          ),
       ]),
       _guideStep(theme, 2, 'Download the Firmware in OpenWrt', [
         _guideText(theme, 'On the OpenWrt console:'),
@@ -1539,7 +1869,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ] else ...[
               _guideBullet(theme, 'Connect to the router normally.'),
               _guideBullet(theme, 'Remove the static address (or set IPv4 back to Automatic):'),
-              _guideCode(theme, 'sudo ip addr del 192.168.1.100/24 dev eth0'),
+              _guideCode(theme, 'sudo ip addr del 192.168.1.2/24 dev eth0'),
               _guideBullet(theme, 'Optionally stop the TFTP server:'),
               _guideCode(theme, 'sudo systemctl stop tftpd-hpa'),
             ],
@@ -1559,7 +1889,7 @@ class _HomeScreenState extends State<HomeScreen> {
           children: [
             Text('No Serial Output', style: theme.textTheme.titleSmall),
             const SizedBox(height: 6),
-            _guideBullet(theme, 'Verify TX and RX are crossed.'),
+            _guideBullet(theme, 'Verify TX goes to TX and RX goes to RX.'),
             _guideBullet(theme, 'Ensure GND is connected.'),
             if (_isWindows) ...[
               _guideBullet(theme, 'Confirm the correct COM port in Device Manager.'),
@@ -1582,7 +1912,7 @@ class _HomeScreenState extends State<HomeScreen> {
             const SizedBox(height: 6),
             _guideText(theme, 'Verify your ${_os.machine} has the correct IP:'),
             _guideCode(theme, _showIpCommand),
-            _guideText(theme, 'Expected: 192.168.1.100'),
+            _guideText(theme, 'Expected: 192.168.1.2'),
             const SizedBox(height: 4),
             _guideText(theme,
                 'Ensure the TFTP server is running, the HTTP server is running '
@@ -1915,6 +2245,80 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Widget _defaultFirmwareRow(ThemeData theme, DefaultFirmwareImage image) {
+    final selectedPath =
+        image.isUpgrade ? _sysupgradeImagePath : _openwrtInitramfsPath;
+    final selected =
+        selectedPath != null && _basename(selectedPath) == image.fileName;
+    final title = image.isUpgrade
+        ? 'Example upgrade firmware (${image.label})'
+        : 'Default firmware (${image.label})';
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            selected ? Icons.check_circle : Icons.download_for_offline_outlined,
+            size: 20,
+            color: selected ? Colors.green : theme.colorScheme.onSurfaceVariant,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: theme.textTheme.bodyMedium
+                      ?.copyWith(fontWeight: FontWeight.w600),
+                ),
+                Text(image.details, style: theme.textTheme.bodySmall),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          OutlinedButton(
+            onPressed: _downloadingDefault || selected
+                ? null
+                : () => _downloadDefaultImage(image),
+            child: Text(selected ? 'Selected' : 'Download'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _serverStatusLine(
+    ThemeData theme,
+    String message, {
+    required bool error,
+    required bool active,
+  }) {
+    final color = error
+        ? theme.colorScheme.error
+        : (active ? Colors.green.shade700 : theme.colorScheme.onSurfaceVariant);
+    final icon = error
+        ? Icons.error_outline
+        : (active ? Icons.check_circle_outline : Icons.info_outline);
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(icon, size: 18, color: color),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            message,
+            style: theme.textTheme.bodySmall?.copyWith(color: color),
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _filePickRow(
     ThemeData theme,
     String? path,
@@ -2009,6 +2413,27 @@ class _HomeScreenState extends State<HomeScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(
+                  Icons.lan_outlined,
+                  size: 18,
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Connect the router to this computer with an Ethernet '
+                    'cable. Discovery and flashing use the LAN, never Wi-Fi.',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Row(
               children: [
                 if (_discoveryBusy)
                   const SizedBox(
@@ -2027,6 +2452,16 @@ class _HomeScreenState extends State<HomeScreen> {
                 'This computer',
                 '${_network!.localIp} /${_network!.prefixLength} '
                     'via ${_network!.source}',
+              ),
+            ],
+            if (_network != null && _network!.isWireless) ...[
+              const SizedBox(height: 8),
+              _statusLine(
+                theme,
+                CheckOutcome.warning,
+                'Wi-Fi connection',
+                'This computer is on Wi-Fi. Plug the router into an Ethernet '
+                'port before flashing.',
               ),
             ],
             if (_candidates.isNotEmpty) ...[
@@ -2334,15 +2769,12 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             SwitchListTile(
               value: _backupConfig,
-              onChanged: _keepSettings
-                  ? (value) => _runOnUi(() => _backupConfig = value)
-                  : null,
+              onChanged: (value) => _runOnUi(() => _backupConfig = value),
               title: const Text('Download a configuration backup first'),
-              subtitle: Text(
-                _keepSettings
-                    ? 'Runs sysupgrade -b and saves the archive to your '
-                        'computer before anything is written.'
-                    : 'Unavailable when the configuration is being erased.',
+              subtitle: const Text(
+                'Runs sysupgrade -b and saves the archive to your computer '
+                'before anything is written. Recommended especially when the '
+                'configuration is being erased.',
               ),
             ),
             if (_backupFile != null)
@@ -2479,6 +2911,27 @@ class _HomeScreenState extends State<HomeScreen> {
                       _cancelRequested ? 'Cancelling...' : 'Cancel upload',
                     ),
                   )
+                else if (_step == FlashStep.rebootWait && _flashIssued) ...[
+                  OutlinedButton.icon(
+                    onPressed: _skipConfirmation
+                        ? null
+                        : () => _runOnUi(() => _skipConfirmation = true),
+                    icon: const Icon(Icons.fact_check_outlined),
+                    label: Text(
+                      _skipConfirmation
+                          ? 'Showing the result...'
+                          : 'Stop waiting and show result',
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'The image has been installed. Waiting is only for '
+                    'automatic confirmation; stopping does not interrupt the '
+                    'flash.',
+                    textAlign: TextAlign.center,
+                    style: theme.textTheme.bodySmall,
+                  ),
+                ]
                 else if (_installStarted)
                   _statusLine(
                     theme,
@@ -2505,11 +2958,17 @@ class _HomeScreenState extends State<HomeScreen> {
     final verified = _verifiedAfter;
     final error = _flashError;
     final started = _installStarted;
-    final success = verified != null && error == null;
+    final confirmed = verified != null && error == null;
+    final installed = _flashIssued && !confirmed;
+    final success = confirmed || installed;
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(success ? 'Flash complete' : 'Flash did not complete'),
+        title: Text(
+          confirmed
+              ? 'Flash complete'
+              : (installed ? 'Firmware installed' : 'Flash did not complete'),
+        ),
         backgroundColor: theme.colorScheme.primaryContainer,
       ),
       body: Center(
@@ -2530,12 +2989,17 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
               const SizedBox(height: 12),
               Text(
-                success
+                confirmed
                     ? 'Confirmed: the router is running '
                         '${verified.firmwareVersion}.'
-                    : (started
-                        ? 'The flash was started and could not be confirmed.'
-                        : 'Nothing was flashed.'),
+                    : installed
+                        ? 'The sysupgrade command was issued, but the router '
+                            'did not confirm the new firmware within the time '
+                            'limit. Whether it restarted into the new image is '
+                            'not verified yet — check the router below.'
+                        : (started
+                            ? 'The flash was started and could not be confirmed.'
+                            : 'Nothing was flashed.'),
                 textAlign: TextAlign.center,
                 style: theme.textTheme.titleMedium,
               ),
@@ -2560,11 +3024,32 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ),
               ),
+              if (_confirmationNote != null) ...[
+                const SizedBox(height: 16),
+                _statusLine(
+                  theme,
+                  CheckOutcome.warning,
+                  'Why it is unconfirmed',
+                  _confirmationNote!,
+                ),
+              ],
               if (error != null) ...[
                 const SizedBox(height: 16),
                 _statusLine(theme, CheckOutcome.failed, 'What happened', error),
               ],
-              if (started && !success) ...[
+              if (installed) ...[
+                const SizedBox(height: 12),
+                _statusLine(
+                  theme,
+                  CheckOutcome.warning,
+                  'What to do',
+                  'Give the router a few minutes to finish booting. Erasing the '
+                  'configuration usually returns it to its stock address (often '
+                  '192.168.1.1), and this computer may need to renew its DHCP '
+                  'lease to reach it. Confirm below once it answers — do not '
+                  're-flash.',
+                ),
+              ] else if (started && !success) ...[
                 const SizedBox(height: 12),
                 _statusLine(
                   theme,
@@ -2577,6 +3062,10 @@ class _HomeScreenState extends State<HomeScreen> {
                   'router\'s own board name will make things worse.',
                 ),
               ],
+              if (installed) ...[
+                const SizedBox(height: 16),
+                _confirmAddressCard(theme),
+              ],
               const SizedBox(height: 24),
               Center(
                 child: FilledButton(
@@ -2585,6 +3074,12 @@ class _HomeScreenState extends State<HomeScreen> {
                       _verifiedAfter = null;
                       _flashError = null;
                       _installStarted = false;
+                      _flashIssued = false;
+                      _confirmationNote = null;
+                      _skipConfirmation = false;
+                      _confirming = false;
+                      _confirmError = null;
+                      _confirmIpController.clear();
                       _firmwarePath = null;
                       _firmware = null;
                       _ackUnverified = false;
@@ -2592,6 +3087,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       _preflightOk = false;
                       _backupFile = null;
                       _versionBefore = null;
+                      _bootIdBefore = null;
                       _passwordController.clear();
                     });
                     _probeGateways();
@@ -2601,6 +3097,58 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ],
           ),
+        ),
+      ),
+    );
+  }
+
+  Widget _confirmAddressCard(ThemeData theme) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              'Confirm the router\'s new address',
+              style: theme.textTheme.titleSmall,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'After the configuration was erased the router returns to its '
+              'stock address. Enter the address it answers on now and this '
+              'check reads its board name over SSH. It never re-flashes.',
+              style: theme.textTheme.bodySmall,
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _confirmIpController,
+              keyboardType: TextInputType.number,
+              autocorrect: false,
+              decoration: const InputDecoration(
+                labelText: 'Router address',
+                hintText: '192.168.1.1',
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+            ),
+            if (_confirmError != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                _confirmError!,
+                style: TextStyle(color: theme.colorScheme.error),
+              ),
+            ],
+            const SizedBox(height: 12),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: FilledButton.tonalIcon(
+                onPressed: _confirming ? null : _confirmFirmware,
+                icon: const Icon(Icons.how_to_reg),
+                label: Text(_confirming ? 'Checking...' : 'Confirm firmware'),
+              ),
+            ),
+          ],
         ),
       ),
     );
