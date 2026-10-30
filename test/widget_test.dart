@@ -195,33 +195,16 @@ void main() {
     expect(find.textContaining('drag-and-drop'), findsNothing);
   });
 
-  testWidgets('an address you type in offers the host key recovery path',
+  testWidgets('the Flash tab reaches the router only at the LAN gateway',
       (tester) async {
+    tester.view.physicalSize = const Size(1200, 2400);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
     await tester.pumpWidget(app());
 
-    await tester.enterText(
-      find.byType(TextField).first,
-      '192.168.5.1',
-    );
-    await tester.pump();
-    await tester.tap(find.text('Use'));
-    await tester.pumpAndSettle();
-
-    // The pin store has no other way to forget a stale or wrong key.
-    expect(find.textContaining('Forget pinned host key'), findsOneWidget);
-  });
-
-  testWidgets('a gateway with a zero octet is not rejected', (tester) async {
-    await tester.pumpWidget(app());
-
-    // 10.0.0.1 is an ordinary router address; an earlier validator refused any
-    // address containing a 0.
-    await tester.enterText(find.byType(TextField).first, '10.0.0.1');
-    await tester.pump();
-    await tester.tap(find.text('Use'));
-    await tester.pumpAndSettle();
-
-    expect(find.widgetWithText(ListTile, '10.0.0.1'), findsOneWidget);
-    expect(find.textContaining('Enter a full IPv4 address'), findsNothing);
+    expect(find.text('Search again'), findsOneWidget);
+    expect(find.textContaining('default gateway'), findsWidgets);
+    expect(find.text('Find more devices'), findsNothing);
+    expect(find.text('Router IP address'), findsNothing);
   });
 }

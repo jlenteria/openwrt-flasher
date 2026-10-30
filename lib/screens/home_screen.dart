@@ -94,7 +94,6 @@ class _HomeScreenState extends State<HomeScreen> {
   final TextEditingController _usernameController =
       TextEditingController(text: 'root');
   final TextEditingController _passwordController = TextEditingController();
-  final TextEditingController _manualIpController = TextEditingController();
 
   // Recovery state
   String _selectedSerialPort = '';
@@ -130,7 +129,6 @@ class _HomeScreenState extends State<HomeScreen> {
   RouterInfo? _router;
   String _discoveryStatus = 'Not searched yet.';
   bool _discoveryBusy = false;
-  bool _sweepCancelled = false;
 
   String? _firmwarePath;
   FirmwareInfo? _firmware;
@@ -213,7 +211,6 @@ class _HomeScreenState extends State<HomeScreen> {
     _httpServerService.dispose();
     _passwordController.dispose();
     _usernameController.dispose();
-    _manualIpController.dispose();
     _confirmIpController.dispose();
     _consoleScrollController.dispose();
     _tftpDirController.dispose();
@@ -553,63 +550,6 @@ class _HomeScreenState extends State<HomeScreen> {
     _showErrorToast('Search failed: $error');
   }
 
-  Future<void> _sweepSubnet() async {
-    final consent = await showDialog<bool>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('Find more devices?'),
-        content: const Text(
-          'This will search all addresses on your network for devices. '
-          'Only do this if your router is not found in the list above.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(dialogContext).pop(false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.of(dialogContext).pop(true),
-            child: const Text('Search'),
-          ),
-        ],
-      ),
-    );
-    if (consent != true || !mounted) return;
-
-    _sweepCancelled = false;
-    _runOnUi(() {
-      _discoveryBusy = true;
-      _discoveryStatus = 'Searching all devices on network...';
-    });
-    try {
-      final outcome = await _discovery.scanSubnet(
-        shouldContinue: () => !_sweepCancelled && mounted,
-        onProgress: (done, all) => _runOnUi(
-          () => _discoveryStatus =
-              'Searching: $done of $all checked.',
-        ),
-      );
-      if (!mounted) return;
-      _applyDiscovery(
-        outcome.network,
-        outcome.candidates,
-        outcome.warning ?? '',
-        outcome.gateway,
-      );
-      if (outcome.network?.isWireless ?? false) {
-        _showErrorToast(
-          'Connect the router with an Ethernet cable to search the LAN — '
-          'sweeping over Wi-Fi is not supported.',
-        );
-      }
-    } on Object catch (e) {
-      _runOnUi(() {
-        _discoveryBusy = false;
-      });
-      _showErrorToast('Sweep failed: $e');
-    }
-  }
-
   void _applyDiscovery(
     LocalNetwork? network,
     List<RouterCandidate> candidates,
@@ -624,14 +564,12 @@ class _HomeScreenState extends State<HomeScreen> {
       if (candidates.length == 1) _selectedIp = candidates.single.ip;
       if (candidates.isEmpty) {
         _discoveryStatus = warning.isEmpty
-            ? 'No device answered. Enter the address manually.'
+            ? 'No device answered at the LAN gateway.'
             : warning;
       } else {
         _discoveryStatus =
-            '${candidates.length} device(s) answered on ${network?.localIp ?? 'a '
-                'local address'} (netmask /${network?.prefixLength ?? 24}, '
-                '${network?.source ?? 'unknown'}). Identify one below before '
-                'flashing.';
+            'Found the router at the LAN gateway $gateway. Identify it '
+            'before flashing.';
       }
     });
     _invalidateChecks();
@@ -643,43 +581,16 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  void _useManualIp() {
-    final value = _manualIpController.text.trim();
-    // A zero octet is normal in a host address (10.0.0.1), so only the
-    // this-host and limited-broadcast forms are refused.
-    final valid = RouterDiscoveryService.isIPv4(value) &&
-        value != '0.0.0.0' &&
-        value != '255.255.255.255';
-    if (!valid) {
-      const message =
-          'Enter a full IPv4 address such as 192.168.1.1.';
-      _runOnUi(() => _discoveryStatus = message);
-      _showErrorToast(message);
-      return;
-    }
-    _runOnUi(() {
-      if (!_candidates.any((c) => c.ip == value)) {
-        _candidates = [..._candidates,
-            RouterCandidate(ip: value, hint: 'manual', banner: 'entered by you')];
-      }
-      _selectedIp = value;
-      _router = null;
-      _discoveryStatus = 'Using $value. Identify it to confirm it is the '
-          'router you mean to flash.';
-    });
-    _invalidateChecks();
-    _revalidateFirmware();
-  }
-
   // ---------------------------------------------------------------- identity
 
   Future<void> _identifyRouter() async {
-    // The LAN's default gateway is the router on a normal home network, so it
-    // is a better default than making the user type the address again.
+    // The LAN's default gateway is the router, so SSH always goes there.
     final ip = _selectedIp ?? _gateway;
     if (ip == null) {
-      _runOnUi(() => _discoveryStatus = 'Choose or type an address first.');
-      _showErrorToast('Choose or type a router address first.');
+      const message = 'No LAN gateway found. Connect the router with an '
+          'Ethernet cable and press Search again.';
+      _runOnUi(() => _discoveryStatus = message);
+      _showErrorToast(message);
       return;
     }
     _runOnUi(() {
@@ -2521,7 +2432,8 @@ class _HomeScreenState extends State<HomeScreen> {
                 Expanded(
                   child: Text(
                     'Connect the router to this computer with an Ethernet '
-                    'cable. Discovery and flashing use the LAN, never Wi-Fi.',
+                    'cable. The router is reached over SSH at the LAN\'s '
+                    'default gateway; Wi-Fi is never used.',
                     style: theme.textTheme.bodySmall?.copyWith(
                       color: theme.colorScheme.onSurfaceVariant,
                     ),
@@ -2596,54 +2508,11 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ],
             const SizedBox(height: 12),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                OutlinedButton.icon(
-                  onPressed: _discoveryBusy ? null : _probeGateways,
-                  icon: const Icon(Icons.refresh),
-                  label: const Text('Search again'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: _discoveryBusy ? null : _sweepSubnet,
-                  icon: const Icon(Icons.search),
-                  label: const Text('Find more devices'),
-                ),
-              ],
+            OutlinedButton.icon(
+              onPressed: _discoveryBusy ? null : _probeGateways,
+              icon: const Icon(Icons.refresh),
+              label: const Text('Search again'),
             ),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _manualIpController,
-                    keyboardType: TextInputType.number,
-                    decoration: const InputDecoration(
-                      labelText: 'Router IP address',
-                      hintText: '192.168.1.1',
-                      border: OutlineInputBorder(),
-                      isDense: true,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                OutlinedButton(onPressed: _useManualIp, child: const Text('Use')),
-              ],
-            ),
-            if (_discoveryBusy && _candidates.isEmpty) ...[
-              const SizedBox(height: 8),
-              TextButton(
-                onPressed: () {
-                  _sweepCancelled = true;
-                  _runOnUi(
-                    () => _discoveryStatus = 'Search stopped. Enter the address '
-                        'manually.',
-                  );
-                },
-                child: const Text('Stop searching'),
-              ),
-            ],
           ],
         ),
       ),

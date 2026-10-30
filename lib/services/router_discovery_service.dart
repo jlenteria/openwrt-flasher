@@ -27,49 +27,6 @@ class LocalNetwork {
   /// True when the only usable interface is Wi-Fi. Flashing is expected over an
   /// Ethernet cable, so this is surfaced before anything is written.
   final bool isWireless;
-
-  List<int> get _octets => localIp.split('.').map(int.parse).toList();
-
-  int get _mask {
-    if (prefixLength <= 0) return 0;
-    return (0xFFFFFFFF << (32 - prefixLength)) & 0xFFFFFFFF;
-  }
-
-  int get _networkRaw {
-    final octets = _octets;
-    final raw =
-        (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3];
-    return raw & _mask;
-  }
-
-  String _dotted(int value) => '${(value >> 24) & 0xFF}.'
-      '${(value >> 16) & 0xFF}.${(value >> 8) & 0xFF}.${value & 0xFF}';
-
-  String get networkAddress => _dotted(_networkRaw);
-
-  /// The conventional first usable address of this network.
-  String get firstHost => _dotted(_networkRaw + 1);
-
-  /// The conventional last usable address of this network.
-  String get lastHost {
-    final broadcast = _networkRaw | (~_mask & 0xFFFFFFFF);
-    return _dotted(broadcast - 1);
-  }
-
-  /// The address a sweep would start from, honouring the real mask rather than
-  /// assuming the /24 the local address looks like.
-  List<String> hosts({int limit = 1024}) {
-    final count = hostCount < limit ? hostCount : limit;
-    return [for (var i = 1; i <= count; i++) _dotted(_networkRaw + i)];
-  }
-
-  int get hostCount {
-    if (prefixLength >= 31) return 1;
-    final usable = (1 << (32 - prefixLength)) - 2;
-    return usable < 1 ? 1 : usable;
-  }
-
-  bool get isWiderThanClassC => prefixLength < 24;
 }
 
 class DiscoveryOutcome {
@@ -92,7 +49,6 @@ class DiscoveryOutcome {
 /// router: only an SSH read of `/tmp/sysinfo/board_name` establishes identity.
 class RouterDiscoveryService {
   static const gatewayProbeTimeout = Duration(seconds: 2);
-  static const scanConcurrency = 24;
   static const defaultPrefixLength = 24;
 
   /// Determines the IPv4 address of the wired LAN interface the router is on.
@@ -159,6 +115,45 @@ class RouterDiscoveryService {
           fields[3] == interfaceName &&
           isIPv4(fields[1])) {
         return fields[1];
+      }
+    }
+    // A manually configured service has no DHCP lease and is not the primary
+    // default route, but System Settings still stores its router.
+    return _macServiceRouter(interfaceName);
+  }
+
+  Future<String?> _macServiceRouter(String interfaceName) async {
+    final order = await Process.run(
+      '/usr/sbin/networksetup',
+      ['-listnetworkserviceorder'],
+    );
+    if (order.exitCode != 0) return null;
+    final header = RegExp(r'^\((?:\d+|\*)\)\s+(.+)$');
+    final device = RegExp('Device:\\s*${RegExp.escape(interfaceName)}\\)');
+    String? current;
+    String? service;
+    for (final line in '${order.stdout}'.split('\n')) {
+      final trimmed = line.trim();
+      final match = header.firstMatch(trimmed);
+      if (match != null) {
+        current = match.group(1)!.trim();
+      } else if (current != null && device.hasMatch(trimmed)) {
+        service = current;
+        break;
+      }
+    }
+    if (service == null) return null;
+
+    final info = await Process.run(
+      '/usr/sbin/networksetup',
+      ['-getinfo', service],
+    );
+    if (info.exitCode != 0) return null;
+    for (final line in '${info.stdout}'.split('\n')) {
+      final trimmed = line.trim();
+      if (trimmed.startsWith('Router:')) {
+        final value = trimmed.substring('Router:'.length).trim();
+        if (isIPv4(value)) return value;
       }
     }
     return null;
@@ -302,170 +297,45 @@ class RouterDiscoveryService {
     return hosts;
   }
 
-  static int? prefixFromMask(String? mask) {
-    if (mask == null || mask.isEmpty) return null;
-    if (mask.contains('/')) {
-      final bits = int.tryParse(mask.split('/').last);
-      return bits != null && bits > 0 && bits <= 32 ? bits : null;
-    }
-    if (!isIPv4(mask)) return null;
-    var bits = 0;
-    var seenHostBits = false;
-    for (final octet in mask.split('.').map(int.parse)) {
-      for (var shift = 7; shift >= 0; shift--) {
-        final on = (octet >> shift) & 1 == 1;
-        if (on) {
-          if (seenHostBits) return null;
-          bits++;
-        } else {
-          seenHostBits = true;
-        }
-      }
-    }
-    return bits == 0 ? null : bits;
-  }
-
   static bool _isLinkLocal(String ip) => ip.startsWith('169.254.');
 
-  /// The addresses [probeGateways] tries, in order: the LAN's real default
-  /// gateway first, then the conventional router positions of the local /24.
-  static List<String> gatewayProbeHosts(LocalNetwork network, {String? gateway}) {
-    final hosts = <String>[];
-    if (gateway != null && isIPv4(gateway) && gateway != network.localIp) {
-      hosts.add(gateway);
-    }
-    final base = network.localIp.split('.').take(3).join('.');
-    for (final offset in const ['1', '254', '100', '2', '20', '10']) {
-      final host = '$base.$offset';
-      if (!hosts.contains(host)) hosts.add(host);
-    }
-    // With a wider mask the gateway need not sit in the local /24 at all.
-    if (network.isWiderThanClassC) {
-      for (final host in [network.firstHost, network.lastHost]) {
-        if (!hosts.contains(host)) hosts.add(host);
-      }
-    }
-    return hosts;
-  }
-
-  /// Probes the LAN default gateway first, then the usual gateway positions.
-  /// Cheap, and usually conclusive.
+  /// Probes the default gateway of the wired LAN, which is the router on a
+  /// normal network. There is no subnet sweep and no manual address: the
+  /// gateway is the only address the app talks to.
   Future<DiscoveryOutcome> probeGateways() async {
     final network = await localNetwork();
     if (network == null) {
       return const DiscoveryOutcome(
         network: null,
         candidates: [],
-        warning: 'Could not determine this computer\'s IPv4 address. Is it on '
-            'the same network as the router?',
+        warning: 'Could not determine an IPv4 address for the Ethernet '
+            'interface. Connect the router with a cable.',
       );
     }
     final gateway = await defaultGateway(network);
-    final base = network.localIp.split('.').take(3).join('.');
-    final probeHosts = gatewayProbeHosts(network, gateway: gateway);
-
-    final found = await _probeAll(probeHosts);
+    if (gateway == null || gateway == network.localIp) {
+      return DiscoveryOutcome(
+        network: network,
+        candidates: const [],
+        warning: network.isWireless
+            ? 'This computer is connected over Wi-Fi (${network.source}). Plug '
+                'the router into an Ethernet port and search again — flashing '
+                'over Wi-Fi is not supported.'
+            : 'The Ethernet interface has no default gateway. Set it to DHCP '
+                'so the router can hand out an address, then search again.',
+      );
+    }
+    final candidate = await _probe(gateway, gatewayProbeTimeout);
     return DiscoveryOutcome(
       network: network,
-      candidates: found,
+      candidates: candidate == null ? const [] : [candidate],
       gateway: gateway,
-      warning: found.isEmpty
-          ? (network.isWireless
-              ? 'This computer is connected over Wi-Fi ($base.0/'
-                  '${network.prefixLength}). Plug the router into an Ethernet '
-                  'port and search again — flashing over Wi-Fi is not '
-                  'supported.'
-              : 'Nothing answered ${gateway == null ? '' : 'on the LAN gateway '
-                  '$gateway or '}on the usual addresses of $base.0/'
-                  '${network.prefixLength}. You can scan the whole subnet, or '
-                  'type the router address in by hand.')
+      warning: candidate == null
+          ? 'The LAN gateway $gateway did not answer on SSH or with a LuCI '
+              'page. Check that the router is on and connected to this '
+              'computer.'
           : null,
     );
-  }
-
-  /// Sweeps the subnet. This touches every host on the network, so the caller
-  /// has to ask the user first, and the range is capped.
-  Future<DiscoveryOutcome> scanSubnet({
-    int hostLimit = scanConcurrency * 44,
-    bool Function()? shouldContinue,
-    void Function(int probed, int total)? onProgress,
-  }) async {
-    final network = await localNetwork();
-    if (network == null) {
-      return const DiscoveryOutcome(
-        network: null,
-        candidates: [],
-        warning: 'Could not determine this computer\'s IPv4 address.',
-      );
-    }
-    if (network.isWireless) {
-      return DiscoveryOutcome(
-        network: network,
-        candidates: [],
-        warning: 'This computer is connected over Wi-Fi. Connect the router '
-            'with an Ethernet cable and search again — sweeping or flashing '
-            'over Wi-Fi is not supported.',
-      );
-    }
-    if (network.isWiderThanClassC) {
-      return DiscoveryOutcome(
-        network: network,
-        candidates: [],
-        warning: 'The local prefix is /${network.prefixLength}, which is too '
-            'large to sweep safely. Enter the router address manually.',
-      );
-    }
-    final gateway = await defaultGateway(network);
-    final hosts = network.hosts(limit: hostLimit);
-    // The gateway may live outside this /24 (a different LAN than the address
-    // this computer was left on), so sweep it even when the ranges differ.
-    if (gateway != null &&
-        isIPv4(gateway) &&
-        gateway != network.localIp &&
-        !hosts.contains(gateway)) {
-      hosts.insert(0, gateway);
-    }
-    final found = await _probeAll(
-      hosts,
-      shouldContinue: shouldContinue,
-      onProgress: onProgress,
-    );
-    return DiscoveryOutcome(
-      network: network,
-      candidates: found,
-      gateway: gateway,
-      warning: found.isEmpty ? 'Swept ${hosts.length} addresses, no match.' : null,
-    );
-  }
-
-  Future<List<RouterCandidate>> _probeAll(
-    List<String> hosts, {
-    bool Function()? shouldContinue,
-    void Function(int probed, int total)? onProgress,
-    Duration timeout = gatewayProbeTimeout,
-  }) async {
-    final results = <RouterCandidate>[];
-    for (var index = 0; index < hosts.length; index += scanConcurrency) {
-      if (shouldContinue != null && !shouldContinue()) break;
-      final batch = hosts.sublist(
-        index,
-        index + scanConcurrency > hosts.length ? hosts.length : index + scanConcurrency,
-      );
-      final settled = await Future.wait(
-        batch.map<Future<RouterCandidate?>>((host) => _probe(host, timeout)),
-      );
-      for (final candidate in settled) {
-        if (candidate != null) results.add(candidate);
-      }
-      onProgress?.call(index + batch.length, hosts.length);
-    }
-    results.sort((a, b) => _comparable(a.ip).compareTo(_comparable(b.ip)));
-    return results;
-  }
-
-  int _comparable(String ip) {
-    final parts = ip.split('.').map(int.parse).toList();
-    return (parts[2] << 8) | parts[3];
   }
 
   Future<RouterCandidate?> _probe(String ip, Duration timeout) async {
