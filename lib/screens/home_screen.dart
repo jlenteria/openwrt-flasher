@@ -974,7 +974,7 @@ class _HomeScreenState extends State<HomeScreen> {
         expectedBoard: router.boardName,
         previousBootId: _bootIdBefore,
         shouldStop: () => _skipConfirmation,
-        timeout: const Duration(minutes: 3),
+        timeout: const Duration(minutes: 1),
         onStatus: (message) => _setStep(FlashStep.rebootWait, message),
       );
 

@@ -777,7 +777,7 @@ class SSHService {
     String? expectedBoard,
     String? previousBootId,
     bool Function()? shouldStop,
-    Duration timeout = const Duration(minutes: 3),
+    Duration timeout = const Duration(minutes: 1),
     void Function(String status)? onStatus,
   }) async {
     final deadline = DateTime.now().add(timeout);
@@ -786,23 +786,33 @@ class SSHService {
     var settled = false;
 
     bool stopped() => shouldStop?.call() ?? false;
+    Duration remaining() => deadline.difference(DateTime.now());
+    Duration bounded(Duration limit) =>
+        remaining() < limit ? remaining() : limit;
 
-    while (DateTime.now().isBefore(deadline)) {
+    waitLoop:
+    while (true) {
+      if (remaining() <= Duration.zero) break;
       if (stopped()) {
         throw const SSHOperationException(
           'You stopped waiting before the router confirmed the flash.',
         );
       }
-      final reachable = await _reachableHosts(hosts);
+      final reachable = await _reachableHosts(
+        hosts,
+        timeout: bounded(const Duration(seconds: 3)),
+      );
       if (reachable.isEmpty) {
-        await Future<void>.delayed(const Duration(seconds: 3));
+        final pause = bounded(const Duration(seconds: 3));
+        if (pause > Duration.zero) await Future<void>.delayed(pause);
         continue;
       }
       sawOpenPort = true;
       if (!settled) {
         // First boot can restart dropbear; give it a moment before a session.
         onStatus?.call('Router is back online, confirming the new firmware...');
-        await Future<void>.delayed(const Duration(seconds: 5));
+        final pause = bounded(const Duration(seconds: 5));
+        if (pause > Duration.zero) await Future<void>.delayed(pause);
         settled = true;
         if (stopped()) {
           throw const SSHOperationException(
@@ -817,15 +827,22 @@ class SSHService {
               'You stopped waiting before the router confirmed the flash.',
             );
           }
+          if (remaining() <= Duration.zero) break waitLoop;
           try {
-            await connect(host, username, password);
-            final info = await identify(host);
+            // Every step is capped by the deadline, so an unresponsive
+            // dropbear cannot hold the wait past the time limit.
+            await connect(host, username, password).timeout(remaining());
+            final identifyWindow = remaining();
+            if (identifyWindow <= Duration.zero) break waitLoop;
+            final info = await identify(host).timeout(identifyWindow);
             if (expectedBoard == null || info.boardName == expectedBoard) {
               // A device that still runs the pre-flash boot is the old system
               // answering while sysupgrade writes the image. Confirming it
               // would report success before anything has restarted.
               if (previousBootId != null) {
-                final currentBootId = await bootId();
+                final bootWindow = remaining();
+                if (bootWindow <= Duration.zero) break waitLoop;
+                final currentBootId = await bootId().timeout(bootWindow);
                 if (currentBootId != null && currentBootId == previousBootId) {
                   lastError = SSHOperationException(
                     'The router at $host has not restarted since the flash was '
@@ -848,35 +865,38 @@ class SSHService {
         }
       }
       onStatus?.call('Waiting for the router to finish booting...');
-      await Future<void>.delayed(const Duration(seconds: 5));
+      final pause = bounded(const Duration(seconds: 5));
+      if (pause <= Duration.zero) break;
+      await Future<void>.delayed(pause);
     }
 
+    final limit = timeout.inMinutes == 1
+        ? '1 minute'
+        : '${timeout.inMinutes} minutes';
     if (!sawOpenPort) {
       throw SSHOperationException(
         'The router did not accept SSH connections on '
-        '${hosts.join(', ')} within ${timeout.inMinutes} minutes. It may still '
-        'be booting, or the flash may have failed. Check the router before '
-        'retrying.',
+        '${hosts.join(', ')} within $limit. It may still be booting, or the '
+        'flash may have failed. Check the router before retrying.',
       );
     }
     throw SSHOperationException(
       'The router answered on port 22 but a session could not be confirmed'
-      '${expectedBoard == null ? '' : ' as "$expectedBoard"'} within '
-      '${timeout.inMinutes} minutes: $lastError',
+      '${expectedBoard == null ? '' : ' as "$expectedBoard"'} within $limit: '
+      '$lastError',
     );
   }
 
   /// Probes port 22 on every host concurrently and returns the reachable ones.
-  Future<List<String>> _reachableHosts(List<String> hosts) async {
+  Future<List<String>> _reachableHosts(
+    List<String> hosts, {
+    Duration timeout = const Duration(seconds: 3),
+  }) async {
     final results = await Future.wait(
       hosts.map((host) async {
         Socket? probe;
         try {
-          probe = await Socket.connect(
-            host,
-            22,
-            timeout: const Duration(seconds: 3),
-          );
+          probe = await Socket.connect(host, 22, timeout: timeout);
           return host;
         } catch (_) {
           return null;
