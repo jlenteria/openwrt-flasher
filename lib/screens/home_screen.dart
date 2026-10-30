@@ -124,6 +124,7 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _httpServerError = false;
 
   LocalNetwork? _network;
+  String? _gateway;
   List<RouterCandidate> _candidates = [];
   String? _selectedIp;
   RouterInfo? _router;
@@ -536,7 +537,12 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       final outcome = await _discovery.probeGateways();
       if (!mounted) return;
-      _applyDiscovery(outcome.network, outcome.candidates, outcome.warning ?? '');
+      _applyDiscovery(
+        outcome.network,
+        outcome.candidates,
+        outcome.warning ?? '',
+        outcome.gateway,
+      );
       return;
     } on Object catch (e) {
       error = '$e';
@@ -584,7 +590,12 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
       );
       if (!mounted) return;
-      _applyDiscovery(outcome.network, outcome.candidates, outcome.warning ?? '');
+      _applyDiscovery(
+        outcome.network,
+        outcome.candidates,
+        outcome.warning ?? '',
+        outcome.gateway,
+      );
       if (outcome.network?.isWireless ?? false) {
         _showErrorToast(
           'Connect the router with an Ethernet cable to search the LAN — '
@@ -603,9 +614,11 @@ class _HomeScreenState extends State<HomeScreen> {
     LocalNetwork? network,
     List<RouterCandidate> candidates,
     String warning,
+    String? gateway,
   ) {
     _runOnUi(() {
       _network = network;
+      _gateway = gateway;
       _discoveryBusy = false;
       _candidates = candidates;
       if (candidates.length == 1) _selectedIp = candidates.single.ip;
@@ -661,7 +674,9 @@ class _HomeScreenState extends State<HomeScreen> {
   // ---------------------------------------------------------------- identity
 
   Future<void> _identifyRouter() async {
-    final ip = _selectedIp;
+    // The LAN's default gateway is the router on a normal home network, so it
+    // is a better default than making the user type the address again.
+    final ip = _selectedIp ?? _gateway;
     if (ip == null) {
       _runOnUi(() => _discoveryStatus = 'Choose or type an address first.');
       _showErrorToast('Choose or type a router address first.');
@@ -680,6 +695,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _runOnUi(() {
         _discoveryBusy = false;
         _router = identity;
+        _selectedIp ??= ip;
         _versionBefore = identity.firmwareVersion;
         _discoveryStatus = 'Confirmed: ${identity.boardName} at '
             '${identity.ip} running ${identity.firmwareVersion}.';
@@ -2534,6 +2550,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 '${_network!.localIp} /${_network!.prefixLength} '
                     'via ${_network!.source}',
               ),
+              if (_gateway != null) _kv(theme, 'LAN gateway', _gateway!),
             ],
             if (_network != null && _network!.isWireless) ...[
               const SizedBox(height: 8),
@@ -2667,7 +2684,8 @@ class _HomeScreenState extends State<HomeScreen> {
             Align(
               alignment: Alignment.centerLeft,
               child: FilledButton.tonalIcon(
-                onPressed: _selectedIp == null || _discoveryBusy
+                onPressed: (_selectedIp == null && _gateway == null) ||
+                        _discoveryBusy
                     ? null
                     : _identifyRouter,
                 icon: const Icon(Icons.how_to_reg),

@@ -74,6 +74,50 @@ void main() {
     });
   });
 
+  group('gateway probing', () {
+    test('the LAN default gateway is probed before the usual addresses', () {
+      final network = LocalNetwork(
+        localIp: '192.168.1.50',
+        prefixLength: 24,
+        source: 'test',
+      );
+      final hosts = RouterDiscoveryService.gatewayProbeHosts(
+        network,
+        gateway: '10.0.0.1',
+      );
+      expect(hosts.first, '10.0.0.1',
+          reason: 'a router on another subnet still answers at the gateway');
+    });
+
+    test('a gateway on the local subnet is not repeated', () {
+      final network = LocalNetwork(
+        localIp: '192.168.1.50',
+        prefixLength: 24,
+        source: 'test',
+      );
+      final hosts = RouterDiscoveryService.gatewayProbeHosts(
+        network,
+        gateway: '192.168.1.1',
+      );
+      expect(hosts.take(2), ['192.168.1.1', '192.168.1.254']);
+      expect(hosts.where((host) => host == '192.168.1.1').length, 1);
+    });
+
+    test('the computer itself is never treated as the gateway', () {
+      final network = LocalNetwork(
+        localIp: '10.0.0.5',
+        prefixLength: 24,
+        source: 'test',
+      );
+      final hosts = RouterDiscoveryService.gatewayProbeHosts(
+        network,
+        gateway: '10.0.0.5',
+      );
+      expect(hosts.first, '10.0.0.1');
+      expect(hosts, isNot(contains('10.0.0.5')));
+    });
+  });
+
   group('post-flash addresses', () {
     test('probes the old address first, then the stock ones', () {
       expect(

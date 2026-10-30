@@ -11,10 +11,15 @@ class LocalNetwork {
     required this.prefixLength,
     required this.source,
     this.isWireless = false,
+    this.interfaceName,
   });
 
   final String localIp;
   final int prefixLength;
+
+  /// The OS interface name (`en5`, `eth0`, `Ethernet`), used to ask the OS for
+  /// that interface's default gateway. Null when the caller did not supply it.
+  final String? interfaceName;
 
   /// Where the answer came from, for display when it is a guess.
   final String source;
@@ -68,10 +73,19 @@ class LocalNetwork {
 }
 
 class DiscoveryOutcome {
-  const DiscoveryOutcome({required this.network, required this.candidates, this.warning});
+  const DiscoveryOutcome({
+    required this.network,
+    required this.candidates,
+    this.warning,
+    this.gateway,
+  });
   final LocalNetwork? network;
   final List<RouterCandidate> candidates;
   final String? warning;
+
+  /// The LAN interface's default gateway, when the OS reports one. On home
+  /// networks this is the router itself.
+  final String? gateway;
 }
 
 /// Finds candidate devices on the LAN. It never claims a device *is* the
@@ -107,7 +121,88 @@ class RouterDiscoveryService {
       prefixLength: defaultPrefixLength,
       source: onWifi ? 'Wi-Fi (${chosen.name})' : 'Ethernet (${chosen.name})',
       isWireless: onWifi,
+      interfaceName: chosen.name,
     );
+  }
+
+  /// The default gateway configured on the LAN interface. macOS, Linux and
+  /// Windows keep this per interface, so it is asked for by interface name:
+  /// the system-wide default route may belong to Wi-Fi, which is never used.
+  Future<String?> defaultGateway(LocalNetwork network) async {
+    final interfaceName = network.interfaceName;
+    if (interfaceName == null) return null;
+    try {
+      if (Platform.isMacOS) return await _macGateway(interfaceName);
+      if (Platform.isLinux) return await _linuxGateway(interfaceName);
+      if (Platform.isWindows) return await _windowsGateway(network.localIp);
+    } catch (_) {}
+    return null;
+  }
+
+  Future<String?> _macGateway(String interfaceName) async {
+    // DHCP option 3 for that interface. `networksetup`/`netstat` are only a
+    // fallback: their default route is the primary service, not this one.
+    final dhcp = await Process.run(
+      '/usr/sbin/ipconfig',
+      ['getoption', interfaceName, 'router'],
+    );
+    if (dhcp.exitCode == 0) {
+      final value = '${dhcp.stdout}'.trim();
+      if (isIPv4(value)) return value;
+    }
+    final netstat = await Process.run('/usr/sbin/netstat', ['-rn', '-f', 'inet']);
+    if (netstat.exitCode != 0) return null;
+    for (final line in '${netstat.stdout}'.split('\n')) {
+      final fields = line.trim().split(RegExp(r'\s+'));
+      if (fields.length >= 4 &&
+          fields[0] == 'default' &&
+          fields[3] == interfaceName &&
+          isIPv4(fields[1])) {
+        return fields[1];
+      }
+    }
+    return null;
+  }
+
+  Future<String?> _linuxGateway(String interfaceName) async {
+    // GUI launches often have a PATH without sbin, where `ip` usually lives.
+    for (final command in const ['ip', '/usr/sbin/ip', '/sbin/ip']) {
+      ProcessResult route;
+      try {
+        route = await Process.run(
+          command,
+          ['route', 'show', 'default', 'dev', interfaceName],
+        );
+      } catch (_) {
+        continue;
+      }
+      if (route.exitCode != 0) continue;
+      for (final line in '${route.stdout}'.split('\n')) {
+        final fields = line.trim().split(RegExp(r'\s+'));
+        final via = fields.indexOf('via');
+        if (via >= 0 && via + 1 < fields.length && isIPv4(fields[via + 1])) {
+          return fields[via + 1];
+        }
+      }
+    }
+    return null;
+  }
+
+  Future<String?> _windowsGateway(String localIp) async {
+    // route print columns: destination, netmask, gateway, interface IP, metric.
+    final route = await Process.run('route', ['print', '-4']);
+    if (route.exitCode != 0) return null;
+    for (final line in '${route.stdout}'.split('\n')) {
+      final fields = line.trim().split(RegExp(r'\s+'));
+      if (fields.length >= 5 &&
+          fields[0] == '0.0.0.0' &&
+          fields[1] == '0.0.0.0' &&
+          fields[3] == localIp &&
+          isIPv4(fields[2])) {
+        return fields[2];
+      }
+    }
+    return null;
   }
 
   Future<List<({String name, String ip})>> _siteLocalIPv4s() async {
@@ -232,7 +327,29 @@ class RouterDiscoveryService {
 
   static bool _isLinkLocal(String ip) => ip.startsWith('169.254.');
 
-  /// Probes the usual gateway positions first. Cheap, and usually conclusive.
+  /// The addresses [probeGateways] tries, in order: the LAN's real default
+  /// gateway first, then the conventional router positions of the local /24.
+  static List<String> gatewayProbeHosts(LocalNetwork network, {String? gateway}) {
+    final hosts = <String>[];
+    if (gateway != null && isIPv4(gateway) && gateway != network.localIp) {
+      hosts.add(gateway);
+    }
+    final base = network.localIp.split('.').take(3).join('.');
+    for (final offset in const ['1', '254', '100', '2', '20', '10']) {
+      final host = '$base.$offset';
+      if (!hosts.contains(host)) hosts.add(host);
+    }
+    // With a wider mask the gateway need not sit in the local /24 at all.
+    if (network.isWiderThanClassC) {
+      for (final host in [network.firstHost, network.lastHost]) {
+        if (!hosts.contains(host)) hosts.add(host);
+      }
+    }
+    return hosts;
+  }
+
+  /// Probes the LAN default gateway first, then the usual gateway positions.
+  /// Cheap, and usually conclusive.
   Future<DiscoveryOutcome> probeGateways() async {
     final network = await localNetwork();
     if (network == null) {
@@ -243,26 +360,23 @@ class RouterDiscoveryService {
             'the same network as the router?',
       );
     }
+    final gateway = await defaultGateway(network);
     final base = network.localIp.split('.').take(3).join('.');
-    final probeHosts = <String>{
-      for (final offset in const ['1', '254', '100', '2', '20', '10'])
-        '$base.$offset',
-      // With a wider mask the gateway need not sit in the local /24 at all.
-      if (network.isWiderThanClassC) network.firstHost,
-      if (network.isWiderThanClassC) network.lastHost,
-    }.toList();
+    final probeHosts = gatewayProbeHosts(network, gateway: gateway);
 
     final found = await _probeAll(probeHosts);
     return DiscoveryOutcome(
       network: network,
       candidates: found,
+      gateway: gateway,
       warning: found.isEmpty
           ? (network.isWireless
               ? 'This computer is connected over Wi-Fi ($base.0/'
                   '${network.prefixLength}). Plug the router into an Ethernet '
                   'port and search again — flashing over Wi-Fi is not '
                   'supported.'
-              : 'Nothing answered on the usual gateway addresses of $base.0/'
+              : 'Nothing answered ${gateway == null ? '' : 'on the LAN gateway '
+                  '$gateway or '}on the usual addresses of $base.0/'
                   '${network.prefixLength}. You can scan the whole subnet, or '
                   'type the router address in by hand.')
           : null,
@@ -301,7 +415,16 @@ class RouterDiscoveryService {
             'large to sweep safely. Enter the router address manually.',
       );
     }
+    final gateway = await defaultGateway(network);
     final hosts = network.hosts(limit: hostLimit);
+    // The gateway may live outside this /24 (a different LAN than the address
+    // this computer was left on), so sweep it even when the ranges differ.
+    if (gateway != null &&
+        isIPv4(gateway) &&
+        gateway != network.localIp &&
+        !hosts.contains(gateway)) {
+      hosts.insert(0, gateway);
+    }
     final found = await _probeAll(
       hosts,
       shouldContinue: shouldContinue,
@@ -310,6 +433,7 @@ class RouterDiscoveryService {
     return DiscoveryOutcome(
       network: network,
       candidates: found,
+      gateway: gateway,
       warning: found.isEmpty ? 'Swept ${hosts.length} addresses, no match.' : null,
     );
   }
