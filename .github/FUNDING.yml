@@ -1,0 +1,2 @@
+# Shows the "Sponsor" button on the repository, pointing at the support QR.
+custom: ['https://github.com/jlenteria/openwrt-flasher/blob/main/docs/SUPPORT.md']

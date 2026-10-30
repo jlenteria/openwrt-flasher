@@ -49,3 +49,9 @@ sudo make install-linux PREFIX=/usr/local   # system-wide
 
 This installs the app, its icon and `linux/packaging/com.bling.openwrtFlasher.desktop`, so it shows up in
 the application menu and dock. `make uninstall-linux` (with the same `PREFIX`) removes it.
+
+## Support
+
+OpenWrt Flasher is free, with no ads and no accounts. If you would like to send
+an optional, voluntary tip, scan the QR in [Support](docs/SUPPORT.md). It is
+never required.
