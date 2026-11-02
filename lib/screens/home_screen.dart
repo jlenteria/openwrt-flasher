@@ -1,10 +1,13 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
 
+import '../models/console_tail.dart';
+import '../models/support_info.dart';
 import '../models/firmware_info.dart';
 import '../models/router_info.dart';
 import '../services/firmware_download_service.dart';
@@ -55,12 +58,36 @@ class CheckRow {
   final String detail;
 }
 
+/// The console text plus the note shown when the tail window dropped output.
+/// A record type, so a flush that changes nothing does not notify listeners.
+typedef _ConsoleSnapshot = ({String text, String? droppedNote});
+
+const _ConsoleSnapshot _emptyConsole = (text: '', droppedNote: null);
+
+/// Serial chunks are coalesced and republished at most this often. A boot log
+/// bursts 10-50 lines per second and still looks continuous at 8 Hz, while one
+/// repaint of a bounded paragraph costs a few milliseconds instead of the one
+/// whole-app rebuild per chunk this replaces.
+const Duration _consoleFlushInterval = Duration(milliseconds: 120);
+
+/// How much history the console keeps. Layout cost of one text block grows
+/// with what it holds, so an unbounded log gets slower the longer it runs.
+/// SerialService decodes with String.fromCharCodes, so one String length unit
+/// is one received byte.
+const int _consoleTailBytes = 64 * 1024;
+const int _consoleTailLines = 2000;
+
+/// How far from the bottom the console may be and still follow the stream.
+/// Scrolling further up leaves the history alone.
+const double _consoleStickTolerance = 64.0;
+
 class HomeScreen extends StatefulWidget {
   const HomeScreen({
     super.key,
     this.autoDiscover = true,
     this.autoDiscoverSerial = true,
     this.hostOs,
+    this.serialService,
   });
 
   /// Overrides the detected OS so each platform's guide can be tested.
@@ -75,6 +102,10 @@ class HomeScreen extends StatefulWidget {
   /// Kept off in tests, where libserialport native libs may not be present.
   final bool autoDiscoverSerial;
 
+  /// Injected in tests, where no adapter is attached but the console behaviour
+  /// still has to be exercised. Owns the port when left null.
+  final SerialService? serialService;
+
   @override
   State<HomeScreen> createState() => _HomeScreenState();
 }
@@ -88,7 +119,8 @@ class _HomeScreenState extends State<HomeScreen> {
   final RouterDiscoveryService _discovery = RouterDiscoveryService();
   final FirmwareService _firmwareService = FirmwareService();
   final FirmwareDownloadService _firmwareDownloads = FirmwareDownloadService();
-  final SerialService _serialService = SerialService();
+  late final SerialService _serialService =
+      widget.serialService ?? SerialService();
   final HttpServerService _httpServerService = HttpServerService();
 
   final TextEditingController _usernameController =
@@ -99,7 +131,17 @@ class _HomeScreenState extends State<HomeScreen> {
   String _selectedSerialPort = '';
   List<String> _availablePorts = [];
   bool _serialConnected = false;
-  final StringBuffer _consoleBuffer = StringBuffer();
+  final ConsoleTail _consoleTail = ConsoleTail(
+    maxBytes: _consoleTailBytes,
+    maxLines: _consoleTailLines,
+  );
+
+  /// Serial bytes arrive in many small chunks. They are buffered by
+  /// [_consoleTail] and published to [_consoleSnapshot] at most once every
+  /// [_consoleFlushInterval], so a boot log cannot rebuild the UI per chunk.
+  final ValueNotifier<_ConsoleSnapshot> _consoleSnapshot =
+      ValueNotifier<_ConsoleSnapshot>(_emptyConsole);
+  Timer? _consoleFlushTimer;
   final ScrollController _consoleScrollController = ScrollController();
   StreamSubscription<String>? _serialSub;
   String _recoveryStatus = 'Not connected';
@@ -192,21 +234,7 @@ class _HomeScreenState extends State<HomeScreen> {
     if (widget.autoDiscoverSerial) {
       _refreshSerialPorts();
     }
-    _serialSub = _serialService.dataStream.listen((data) {
-      _runOnUi(() {
-        _consoleBuffer.write(data);
-        // Auto-scroll
-        Future.delayed(const Duration(milliseconds: 50), () {
-          if (_consoleScrollController.hasClients) {
-            _consoleScrollController.animateTo(
-              _consoleScrollController.position.maxScrollExtent,
-              duration: const Duration(milliseconds: 100),
-              curve: Curves.easeOut,
-            );
-          }
-        });
-      });
-    });
+    _serialSub = _serialService.dataStream.listen(_onSerialData);
     if (widget.autoDiscover) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _probeGateways());
     }
@@ -218,7 +246,10 @@ class _HomeScreenState extends State<HomeScreen> {
     _usernameController.removeListener(_invalidateChecks);
     _ssh.disconnect();
     _serialSub?.cancel();
-    _serialService.dispose();
+    _consoleFlushTimer?.cancel();
+    _consoleFlushTimer = null;
+    _consoleSnapshot.dispose();
+    if (widget.serialService == null) _serialService.dispose();
     _httpServerService.dispose();
     _passwordController.dispose();
     _usernameController.dispose();
@@ -229,6 +260,12 @@ class _HomeScreenState extends State<HomeScreen> {
     super.dispose();
   }
 
+  @override
+  void didUpdateWidget(HomeScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.hostOs != oldWidget.hostOs) _guideCardCache.clear();
+  }
+
   void _refreshSerialPorts() {
     _runOnUi(() {
       _availablePorts = _serialService.getAvailablePorts();
@@ -236,6 +273,34 @@ class _HomeScreenState extends State<HomeScreen> {
         _selectedSerialPort = _availablePorts.first;
       }
     });
+  }
+
+  /// Serial data is deliberately kept out of [setState]: publishing to
+  /// [_consoleSnapshot] rebuilds only the console text, not the whole guide.
+  void _onSerialData(String data) {
+    if (!mounted) return;
+    _consoleTail.add(data);
+    _consoleFlushTimer ??= Timer(_consoleFlushInterval, _flushConsoleWindow);
+  }
+
+  void _flushConsoleWindow() {
+    _consoleFlushTimer = null;
+    if (!mounted || !_consoleTail.hasPending) return;
+    _consoleSnapshot.value = (
+      text: _consoleTail.flush(),
+      droppedNote: _consoleTail.droppedBytes == 0
+          ? null
+          : 'Showing the last ${_formatBytes(_consoleTail.maxBytes)} of '
+              '${_formatBytes(_consoleTail.totalBytes)} — older output was '
+              'dropped.',
+    );
+  }
+
+  void _resetConsoleWindow() {
+    _consoleFlushTimer?.cancel();
+    _consoleFlushTimer = null;
+    _consoleTail.clear();
+    _consoleSnapshot.value = _emptyConsole;
   }
 
   Future<void> _connectSerial() async {
@@ -248,6 +313,9 @@ class _HomeScreenState extends State<HomeScreen> {
       _recoveryStatusIsError = false;
     });
     final success = await _serialService.connect(_selectedSerialPort);
+    // A new session must not read next to the previous port's log, and the
+    // totals behind "of N KB" start over.
+    if (success) _resetConsoleWindow();
     _runOnUi(() {
       _serialConnected = success;
       _recoveryStatusIsError = !success;
@@ -267,6 +335,12 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _disconnectSerial() {
     _serialService.disconnect();
+    // Show whatever was already delivered, and keep it: the last lines are
+    // what the user wants to read right after unplugging.
+    if (_consoleFlushTimer != null) {
+      _consoleFlushTimer!.cancel();
+    }
+    _flushConsoleWindow();
     _runOnUi(() {
       _serialConnected = false;
       _recoveryStatus = 'Disconnected';
@@ -303,9 +377,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _clearConsole() {
-    _runOnUi(() {
-      _consoleBuffer.clear();
-    });
+    _resetConsoleWindow();
   }
 
   Future<void> _pickOpenWrtInitramfs() async {
@@ -519,6 +591,55 @@ class _HomeScreenState extends State<HomeScreen> {
   static const String _repositoryUrl =
       'https://github.com/jlenteria/openwrt-flasher';
 
+  /// The tip page. Repeats [SupportInfo] verbatim rather than paraphrasing it:
+  /// the docs and the app have to ask for exactly the same thing.
+  void _showSupport() {
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        final theme = Theme.of(dialogContext);
+        return _dialog(
+          icon: const Icon(Icons.qr_code_2),
+          title: const Text(SupportInfo.title),
+          content: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text(SupportInfo.intro),
+                const SizedBox(height: 12),
+                const Text(SupportInfo.tip),
+                const SizedBox(height: 16),
+                Center(
+                  child: Image.asset(
+                    SupportInfo.qrAsset,
+                    width: 320,
+                    semanticLabel: 'Support QR code',
+                    errorBuilder: (context, error, stackTrace) => Icon(
+                      Icons.qr_code_2,
+                      size: 96,
+                      color: theme.colorScheme.outline,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                const Text(SupportInfo.scan),
+                const SizedBox(height: 12),
+                const Text(SupportInfo.thanks),
+              ],
+            ),
+          ),
+          actions: [
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('Close'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
   void _showAbout() {
     showDialog<void>(
       context: context,
@@ -558,6 +679,13 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ),
           actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(dialogContext).pop();
+                _showSupport();
+              },
+              child: const Text('Support'),
+            ),
             TextButton(
               onPressed: () {
                 Navigator.of(dialogContext).pop();
@@ -1543,8 +1671,12 @@ class _HomeScreenState extends State<HomeScreen> {
   String get _sysupgradeCommand => 'sysupgrade -n /tmp/$_firmwareName';
 
   Widget _buildRecoveryTab(ThemeData theme) {
-    return LayoutBuilder(
-      builder: (context, constraints) {
+    // One selection container for the whole guide, above the LayoutBuilder so
+    // crossing the wide/narrow breakpoint does not recreate the registrar the
+    // cached cards below are attached to.
+    return SelectionArea(
+      child: LayoutBuilder(
+        builder: (context, constraints) {
         final wide = constraints.maxWidth >= 1180;
         final guide = ListView(
           padding: const EdgeInsets.all(24),
@@ -1565,20 +1697,29 @@ class _HomeScreenState extends State<HomeScreen> {
               Icons.format_list_numbered,
               'Follow the steps in order',
               'Start by unplugging the USB-to-TTL adapter from your '
-                  '${_os.machine} if it is plugged in. Steps 1 and 2 prepare '
-                  'your computer, connect the Ethernet (LAN) cable and wire '
-                  'the board. Power on the router in step 3, then plug the '
-                  'adapter back in and open the serial console in step 4.',
+                  '${_os.machine} if it is plugged in. Steps 1 to 3 prepare '
+                  'your computer, wire the board and power on the router. Plug '
+                  'the adapter back in and open the serial console in step 4, '
+                  'then connect the Ethernet (LAN) cable and set the static IP '
+                  'in step 5.',
             ),
             const SizedBox(height: 24),
             _stepHeader(theme, 1, 'Prepare your computer'),
             _prerequisitesCard(theme),
             const SizedBox(height: 24),
             _stepHeader(theme, 2, 'Wire the board'),
-            _hardwareCard(theme),
+            _cachedGuideCard(
+              'hardware',
+              theme.brightness,
+              () => _hardwareCard(theme),
+            ),
             const SizedBox(height: 24),
             _stepHeader(theme, 3, 'Power on the router'),
-            _powerOnCard(theme),
+            _cachedGuideCard(
+              'powerOn',
+              theme.brightness,
+              () => _powerOnCard(theme),
+            ),
             const SizedBox(height: 24),
             _stepHeader(theme, 4, 'Plug in USB-to-TTL and open the serial console'),
             _serialConsoleCard(theme),
@@ -1587,17 +1728,34 @@ class _HomeScreenState extends State<HomeScreen> {
               _consolePanel(theme, height: 520),
             ],
             const SizedBox(height: 24),
-            _stepHeader(theme, 5, 'Load OpenWrt into RAM from the bootloader'),
+            _stepHeader(theme, 5, 'Connect Ethernet and Set a Static IP Address'),
+            _cachedGuideCard(
+              'staticIp',
+              theme.brightness,
+              () => _staticIpCard(theme),
+            ),
+            const SizedBox(height: 24),
+            _stepHeader(theme, 6, 'Load OpenWrt into RAM from the bootloader'),
             _loadImageCard(theme),
             const SizedBox(height: 24),
-            _stepHeader(theme, 6, 'Install OpenWrt permanently'),
+            _stepHeader(theme, 7, 'Install OpenWrt permanently'),
             _installCard(theme),
             const SizedBox(height: 24),
             _header(theme, 'After Installation'),
-            _afterInstallCard(theme),
+            _cachedGuideCard(
+              'afterInstall',
+              theme.brightness,
+              () => _afterInstallCard(theme),
+            ),
             const SizedBox(height: 24),
             _header(theme, 'Troubleshooting'),
-            _troubleshootingCard(theme),
+            // Reads _sysupgradeCommand, so the selected upgrade image is part of
+            // the key or a new file name would never reach the card.
+            _cachedGuideCard(
+              'troubleshooting',
+              (_firmwareName, theme.brightness),
+              () => _troubleshootingCard(theme),
+            ),
             const SizedBox(height: 32),
           ],
         );
@@ -1614,54 +1772,69 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
           ],
-        );
-      },
+          );
+        },
+      ),
     );
   }
 
+  /// Cards of the guide whose content depends on nothing but the theme and the
+  /// host OS. Flutter skips rebuilding a subtree when the new widget is the same
+  /// instance as the one already mounted, so caching these keeps an unrelated
+  /// setState (typing a credential, a status change) from re-laying-out the whole
+  /// guide. A card may only be cached with every value it reads in the variant.
+  /// Note this assumes the app never switches theme modes at runtime (main.dart
+  /// sets only `theme`) and that hot reload is used to refresh a stale cache.
+  final Map<String, Widget> _guideCardCache = {};
+
+  Widget _cachedGuideCard(
+    String name,
+    Object variant,
+    Widget Function() build,
+  ) {
+    final key = '$name|${_os.name}|$variant';
+    return _guideCardCache[key] ??= build();
+  }
+
+  Widget _tftpSetupStep(ThemeData theme) => switch (_os) {
+        HostOs.windows => _guideStep(theme, 1, 'Install Required Software', [
+            _guideText(theme,
+                'Install the USB to TTL driver for your adapter (CH340, CP2102, '
+                'FT232, etc.) if Windows does not recognize it automatically.'),
+            const SizedBox(height: 6),
+            _guideText(theme,
+                'Install a TFTP server such as Tftpd64 and set its base directory to '
+                'the firmware folder below. Once the Ethernet adapter has the '
+                'static IP in step 5, select it (192.168.1.2) as the server '
+                'interface. The bootloader downloads the initramfs image from it.'),
+            _guideCode(theme, 'https://pjo2.github.io/tftpd64/'),
+            _guideText(theme,
+                'Nothing else is needed: this app includes the serial console '
+                '(replaces PuTTY) and the temporary HTTP server (replaces Python).'),
+          ]),
+        HostOs.macos => _guideStep(theme, 1, 'Enable the TFTP Server', [
+            _guideText(theme,
+                'macOS has a built-in TFTP server that serves /private/tftpboot. '
+                'Start it and let this app copy files into the folder:'),
+            _guideCode(theme,
+                'sudo launchctl load -F /System/Library/LaunchDaemons/tftp.plist\n'
+                'sudo chmod 777 /private/tftpboot'),
+            _guideText(theme, 'Optional: a TFTP client to test the server:'),
+            _guideCode(theme, 'brew install tftp-hpa'),
+          ]),
+        HostOs.linux => _guideStep(theme, 1, 'Install the TFTP Server', [
+            _guideText(theme,
+                'Debian/Ubuntu (Fedora: tftp-server; Arch: tftp-hpa). It serves '
+                '/srv/tftp; let this app copy files into the folder:'),
+            _guideCode(theme,
+                'sudo apt install tftpd-hpa\n'
+                'sudo chown \$USER /srv/tftp'),
+          ]),
+      };
+
   Widget _prerequisitesCard(ThemeData theme) {
     final steps = <Widget>[
-      ...switch (_os) {
-        HostOs.windows => [
-            _guideStep(theme, 1, 'Install Required Software', [
-              _guideText(theme,
-                  'Install the USB to TTL driver for your adapter (CH340, CP2102, '
-                  'FT232, etc.) if Windows does not recognize it automatically.'),
-              const SizedBox(height: 6),
-              _guideText(theme,
-                  'Install a TFTP server such as Tftpd64, set its base directory to '
-                  'the firmware folder below, and select 192.168.1.2 (your '
-                  'Ethernet adapter) as the server interface. The bootloader '
-                  'downloads the initramfs image from it.'),
-              _guideCode(theme, 'https://pjo2.github.io/tftpd64/'),
-              _guideText(theme,
-                  'Nothing else is needed: this app includes the serial console '
-                  '(replaces PuTTY) and the temporary HTTP server (replaces Python).'),
-            ]),
-          ],
-        HostOs.macos => [
-            _guideStep(theme, 1, 'Enable the TFTP Server', [
-              _guideText(theme,
-                  'macOS has a built-in TFTP server that serves /private/tftpboot. '
-                  'Start it and let this app copy files into the folder:'),
-              _guideCode(theme,
-                  'sudo launchctl load -F /System/Library/LaunchDaemons/tftp.plist\n'
-                  'sudo chmod 777 /private/tftpboot'),
-              _guideText(theme, 'Optional: a TFTP client to test the server:'),
-              _guideCode(theme, 'brew install tftp-hpa'),
-            ]),
-          ],
-        HostOs.linux => [
-            _guideStep(theme, 1, 'Install the TFTP Server', [
-              _guideText(theme,
-                  'Debian/Ubuntu (Fedora: tftp-server; Arch: tftp-hpa). It serves '
-                  '/srv/tftp; let this app copy files into the folder:'),
-              _guideCode(theme,
-                  'sudo apt install tftpd-hpa\n'
-                  'sudo chown \$USER /srv/tftp'),
-            ]),
-          ],
-      },
+      _cachedGuideCard('tftpSetupStep', theme.brightness, () => _tftpSetupStep(theme)),
       _guideStep(theme, 2, 'Download Required Firmware', [
         _guideLabel(theme, 'Default Firmware (initramfs)'),
         _guideText(theme,
@@ -1754,49 +1927,69 @@ class _HomeScreenState extends State<HomeScreen> {
           ],
         ),
       ]),
-      _guideStep(theme, 4, 'Connect Ethernet and Set a Static IP Address', [
-        _guideText(theme,
-            'Connect an Ethernet cable from a LAN port of the router to your '
-            '${_os.machine}. The static IP below is set on that wired adapter, '
-            'so connect the cable first.'),
-        const SizedBox(height: 6),
-        _guideText(theme,
-            'Use 192.168.1.2: it is the TFTP server address U-Boot uses by default.'),
-        const SizedBox(height: 6),
-        if (_isWindows) ...[
-          _guideText(theme,
-              'Open Control Panel → Network and Sharing Center → Change adapter settings, '
-              'then open your Ethernet adapter properties (IPv4) and set:'),
-          const SizedBox(height: 4),
-          _kv(theme, 'IP Address', '192.168.1.2'),
-          _kv(theme, 'Subnet Mask', '255.255.255.0'),
-          _kv(theme, 'Default Gateway', 'Leave blank'),
-          const SizedBox(height: 6),
-          _guideText(theme,
-              'Or, from a Command Prompt run as administrator (replace "Ethernet" '
-              'with the adapter name shown in Network Connections):'),
-          _guideCode(theme, _staticIpCommand),
-        ] else if (_os == HostOs.macos) ...[
-          _guideText(theme,
-              'Replace en5 with your Ethernet interface. List the interfaces with:'),
-          _guideCode(theme, 'networksetup -listallhardwareports'),
-          _guideCode(theme, _staticIpCommand),
-          _guideText(theme,
-              'Or: System Settings → Network → your Ethernet adapter → Details → '
-              'TCP/IP → Configure IPv4: Manually.'),
-        ] else ...[
-          _guideText(theme,
-              'Replace eth0 with your Ethernet interface (often enp…). List the '
-              'interfaces with:'),
-          _guideCode(theme, 'ip link'),
-          _guideCode(theme, _staticIpCommand),
-          _guideText(theme,
-              'If NetworkManager removes the address again, set IPv4 to Manual on '
-              'the wired connection in Settings → Network instead.'),
-        ],
-      ]),
     ];
     return _stepsCard(steps);
+  }
+
+  Widget _staticIpCard(ThemeData theme) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _guideText(theme,
+                'Do this after the console in step 4 shows output from the board. '
+                'Connect an Ethernet cable from a LAN port of the router to your '
+                '${_os.machine}. The static IP below is set on that wired adapter, '
+                'so connect the cable first.'),
+            const SizedBox(height: 6),
+            _guideText(theme,
+                'Use 192.168.1.2: it is the TFTP server address U-Boot uses by '
+                'default, and step 6 downloads the image from it.'),
+            const SizedBox(height: 6),
+            if (_isWindows) ...[
+              _guideText(theme,
+                  'Open Control Panel → Network and Sharing Center → Change adapter settings, '
+                  'then open your Ethernet adapter properties (IPv4) and set:'),
+              const SizedBox(height: 4),
+              _kv(theme, 'IP Address', '192.168.1.2'),
+              _kv(theme, 'Subnet Mask', '255.255.255.0'),
+              _kv(theme, 'Default Gateway', 'Leave blank'),
+              const SizedBox(height: 6),
+              _guideText(theme,
+                  'Or, from a Command Prompt run as administrator (replace "Ethernet" '
+                  'with the adapter name shown in Network Connections):'),
+              _guideCode(theme, _staticIpCommand),
+              const SizedBox(height: 6),
+              _guideText(theme,
+                  'Now open Tftpd64 and select this adapter (192.168.1.2) as its '
+                  'server interface.'),
+            ] else if (_os == HostOs.macos) ...[
+              _guideText(theme,
+                  'Replace en5 with your Ethernet interface. List the interfaces with:'),
+              _guideCode(theme, 'networksetup -listallhardwareports'),
+              _guideCode(theme, _staticIpCommand),
+              _guideText(theme,
+                  'Or: System Settings → Network → your Ethernet adapter → Details → '
+                  'TCP/IP → Configure IPv4: Manually.'),
+            ] else ...[
+              _guideText(theme,
+                  'Replace eth0 with your Ethernet interface (often enp…). List the '
+                  'interfaces with:'),
+              _guideCode(theme, 'ip link'),
+              _guideCode(theme, _staticIpCommand),
+              _guideText(theme,
+                  'If NetworkManager removes the address again, set IPv4 to Manual on '
+                  'the wired connection in Settings → Network instead.'),
+            ],
+            const SizedBox(height: 6),
+            _guideText(theme, 'Check the address took effect:'),
+            _guideCode(theme, _showIpCommand),
+          ],
+        ),
+      ),
+    );
   }
 
   Widget _hardwareCard(ThemeData theme) {
@@ -1831,6 +2024,9 @@ class _HomeScreenState extends State<HomeScreen> {
                     'assets/images/usb_ttl_adapter.png',
                     Icons.usb,
                     'USB to TTL',
+                    // 140 logical px at up to 2.0 device pixel ratio; the source
+                    // is square and 519 KB.
+                    cacheSize: 280,
                   ),
                 ),
                 const SizedBox(width: 12),
@@ -1889,8 +2085,6 @@ class _HomeScreenState extends State<HomeScreen> {
             _guideText(theme,
                 'Keep the USB-to-TTL adapter unplugged while you do this:'),
             const SizedBox(height: 6),
-            _guideBullet(theme,
-                'Check that the Ethernet cable from step 1 is still connected.'),
             _guideBullet(theme, 'Plug in the router\'s original power adapter.'),
             _guideBullet(theme,
                 'Confirm the power light indicator on the router is ON before '
@@ -1977,6 +2171,11 @@ class _HomeScreenState extends State<HomeScreen> {
           'Speed: 115200 baud (8-N-1). If the connection fails, the status turns '
           'red and a red notification explains why. Close any other program that '
           'may be using the port (screen, PuTTY, Arduino IDE).'),
+      const SizedBox(height: 6),
+      _guideText(theme,
+          'The console is reading correctly when text from the board appears in '
+          'it. Press Enter, or power-cycle the router, if it stays silent. Then '
+          'continue with step 5.'),
     ];
 
     final steps = <Widget>[
@@ -2078,7 +2277,7 @@ class _HomeScreenState extends State<HomeScreen> {
           Icons.info_outline,
           'Temporary OpenWrt',
           'OpenWrt runs from RAM only. It is not permanently installed and will '
-              'be lost after a reboot, so continue with step 6 to install it.',
+              'be lost after a reboot, so continue with step 7 to install it.',
         ),
       ]),
     ];
@@ -2250,7 +2449,7 @@ class _HomeScreenState extends State<HomeScreen> {
             const SizedBox(height: 4),
             _guideText(theme,
                 'Ensure the TFTP server is running, the HTTP server is running '
-                '(step 6 → Start the HTTP Server) and the firmware files were '
+                '(step 7 → Start the HTTP Server) and the firmware files were '
                 'copied to the firmware folder.'),
             const SizedBox(height: 4),
             ...switch (_os) {
@@ -2289,29 +2488,9 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _consolePanel(ThemeData theme, {double? height}) {
-    final output = Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: Colors.black,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: theme.colorScheme.outline),
-      ),
-      child: SingleChildScrollView(
-        controller: _consoleScrollController,
-        child: SizedBox(
-          width: double.infinity,
-          child: SelectableText(
-            _consoleBuffer.isEmpty
-                ? 'No output yet. Connect the serial port and power on the router.'
-                : _consoleBuffer.toString(),
-            style: const TextStyle(
-              fontFamily: 'monospace',
-              fontSize: 12,
-              color: Colors.greenAccent,
-            ),
-          ),
-        ),
-      ),
+    final output = _ConsoleOutput(
+      snapshot: _consoleSnapshot,
+      scrollController: _consoleScrollController,
     );
 
     return Card(
@@ -2457,7 +2636,7 @@ class _HomeScreenState extends State<HomeScreen> {
         content: Text(
           'This sends "$_sysupgradeCommand" to the router. It erases the current '
           'firmware, installs OpenWrt and reboots.\n\n'
-          'Make sure the download in step 6 succeeded. Do not disconnect power '
+          'Make sure the download in step 7 succeeded. Do not disconnect power '
           'during the upgrade.',
         ),
         actions: [
@@ -2557,7 +2736,9 @@ class _HomeScreenState extends State<HomeScreen> {
           Expanded(
             child: Padding(
               padding: const EdgeInsets.symmetric(vertical: 4),
-              child: SelectableText(
+              // Plain Text: the guide is wrapped in one SelectionArea, so the
+              // per-block selection machinery SelectableText adds is not needed.
+              child: Text(
                 code,
                 style: const TextStyle(fontFamily: 'monospace', fontSize: 12.5),
               ),
@@ -2570,6 +2751,9 @@ class _HomeScreenState extends State<HomeScreen> {
               tooltip: 'Copy',
               icon: const Icon(Icons.content_copy),
               onPressed: () {
+                // Cached guide cards can outlive this State; keep using context
+                // only while it is still mounted.
+                if (!mounted) return;
                 Clipboard.setData(ClipboardData(text: code));
                 ScaffoldMessenger.of(context).showSnackBar(
                   const SnackBar(
@@ -2754,7 +2938,13 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _hardwareImage(ThemeData theme, String asset, IconData fallback, String label) {
+  Widget _hardwareImage(
+    ThemeData theme,
+    String asset,
+    IconData fallback,
+    String label, {
+    int? cacheSize,
+  }) {
     return Column(
       children: [
         ClipRRect(
@@ -2763,6 +2953,12 @@ class _HomeScreenState extends State<HomeScreen> {
             asset,
             height: 140,
             fit: BoxFit.contain,
+            // Decodes at display size instead of full resolution. Note this
+            // swaps the provider for a ResizeImage, which find.image() would no
+            // longer match, so only assets that actually need it are resized.
+            cacheWidth: cacheSize,
+            cacheHeight: cacheSize,
+            gaplessPlayback: true,
             errorBuilder: (context, error, stackTrace) => Container(
               height: 140,
               decoration: BoxDecoration(
@@ -3631,6 +3827,124 @@ class _HomeScreenState extends State<HomeScreen> {
           ],
         ),
       ),
+    );
+  }
+}
+
+/// The serial console text on its own, so streaming output rebuilds this widget
+/// instead of the whole screen. It follows the stream only while the user is
+/// already at the bottom, so scrolling back to read history is not fought.
+class _ConsoleOutput extends StatefulWidget {
+  const _ConsoleOutput({
+    required this.snapshot,
+    required this.scrollController,
+  });
+
+  final ValueListenable<_ConsoleSnapshot> snapshot;
+  final ScrollController scrollController;
+
+  static const String placeholder =
+      'No output yet. Connect the serial port and power on the router.';
+  static const TextStyle textStyle = TextStyle(
+    fontFamily: 'monospace',
+    fontSize: 12,
+    color: Colors.greenAccent,
+  );
+
+  @override
+  State<_ConsoleOutput> createState() => _ConsoleOutputState();
+}
+
+class _ConsoleOutputState extends State<_ConsoleOutput> {
+  /// Whether the newest line was on screen before the pending text is applied.
+  /// Measured *before* the rebuild, because after it the extent has already
+  /// grown and a fresh burst would never look pinned.
+  bool _pinned = true;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.snapshot.addListener(_onSnapshot);
+  }
+
+  @override
+  void didUpdateWidget(_ConsoleOutput oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.snapshot != widget.snapshot) {
+      oldWidget.snapshot.removeListener(_onSnapshot);
+      widget.snapshot.addListener(_onSnapshot);
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.snapshot.removeListener(_onSnapshot);
+    super.dispose();
+  }
+
+  void _onSnapshot() {
+    if (!mounted) return;
+    _pinned = !_scrolledUp();
+    setState(() {});
+    // After layout: the jump needs the extent the new text actually produced.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _followIfPinned());
+  }
+
+  /// True when the user is reading somewhere above the newest line. With no
+  /// viewport yet, or while every line already fits, the console follows.
+  bool _scrolledUp() {
+    if (!widget.scrollController.hasClients) return false;
+    final position = widget.scrollController.position;
+    return position.pixels < position.maxScrollExtent - _consoleStickTolerance;
+  }
+
+  void _followIfPinned() {
+    if (!mounted || !_pinned || !widget.scrollController.hasClients) return;
+    final position = widget.scrollController.position;
+    if (position.pixels < position.maxScrollExtent) {
+      position.jumpTo(position.maxScrollExtent);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final snapshot = widget.snapshot.value;
+    final note = snapshot.droppedNote;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (note != null) ...[
+          Text(
+            note,
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 6),
+        ],
+        Expanded(
+          child: Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.black,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: theme.colorScheme.outline),
+            ),
+            child: SingleChildScrollView(
+              controller: widget.scrollController,
+              child: SizedBox(
+                width: double.infinity,
+                child: SelectableText(
+                  snapshot.text.isEmpty ? _ConsoleOutput.placeholder : snapshot.text,
+                  style: _ConsoleOutput.textStyle,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 }

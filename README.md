@@ -52,6 +52,22 @@ the application menu and dock. `make uninstall-linux` (with the same `PREFIX`) r
 
 ## Support
 
-OpenWrt Flasher is free, with no ads and no accounts. If you would like to send
-an optional, voluntary tip, scan the QR in [Support](docs/SUPPORT.md). It is
-never required.
+OpenWrt Flasher is free, with no ads and no accounts. Every feature is available
+to everyone.
+
+If you would like to, you can send an optional, voluntary tip directly to the
+developer. It unlocks nothing and gives no rewards.
+
+<p align="center">
+  <img src="docs/banks/bpi.jpg" alt="Support QR code" width="360">
+</p>
+
+Scan the QR with any QR Ph app. This is a direct person-to-person transfer to the
+developer, not a purchase. The same page is in the app: the info icon in the title
+bar, then **Support**.
+
+Never required. Thank you for using OpenWrt Flasher!
+
+[docs/SUPPORT.md](docs/SUPPORT.md) and `.github/FUNDING.yml` point at this page,
+and `test/support_test.dart` fails if the app and these two files ever word the
+ask differently.

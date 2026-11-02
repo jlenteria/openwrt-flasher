@@ -13,4 +13,6 @@ developer. It unlocks nothing and gives no rewards.
 Scan the QR with any QR Ph app. This is a direct person-to-person transfer to
 the developer, not a purchase.
 
+The same page is in the app: the info icon in the title bar, then **Support**.
+
 Never required. Thank you for using OpenWrt Flasher!

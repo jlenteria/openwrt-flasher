@@ -8,6 +8,13 @@ IS_LINUX := $(filter Linux,$(shell uname -s))
 IS_WINDOWS := $(filter Windows_NT MINGW64_NT% MSYS_NT% CYGWIN_NT%,$(OS) $(shell uname -s))
 
 RUN_TARGET := $(strip $(if $(IS_MAC),run-macos,$(if $(IS_LINUX),run-linux,$(if $(IS_WINDOWS),run-windows,))))
+
+# Debug is JIT and inherently slow; it is not a measure of real frame times.
+# make run-macos RUN_MODE=profile (or release) to benchmark the app. profile
+# keeps the observatory and DevTools, release strips them. profile disables
+# hot reload.
+RUN_MODE ?= debug
+RUN_FLAGS := $(if $(filter profile,$(RUN_MODE)),--profile,$(if $(filter release,$(RUN_MODE)),--release,))
 BUILD_TARGET := $(strip $(if $(IS_MAC),build-macos,$(if $(IS_LINUX),build-linux,$(if $(IS_WINDOWS),build-windows,))))
 
 # Linux desktop integration. Defaults to a per-user install; use
@@ -36,6 +43,9 @@ help:
 	@echo "  make run-windows  - Run on Windows"
 	@echo "  make run-linux    - Run on Linux"
 	@echo "  make run-all      - Run on this machine's desktop platform"
+	@echo "                      Append RUN_MODE=profile or RUN_MODE=release to any"
+	@echo "                      run target to benchmark an AOT build (debug is JIT"
+	@echo "                      and far slower; profile keeps DevTools, release does not)"
 	@echo ""
 	@echo "Build (Release):"
 	@echo "  make build-macos  - Build for macOS"
@@ -68,16 +78,16 @@ icons:
 	dart run tool/generate_icons.dart
 
 run-macos:
-	@echo "Running on macOS..."
-	flutter run -d macos
+	@echo "Running on macOS ($(RUN_MODE))..."
+	flutter run -d macos $(RUN_FLAGS)
 
 run-windows:
-	@echo "Running on Windows..."
-	flutter run -d windows
+	@echo "Running on Windows ($(RUN_MODE))..."
+	flutter run -d windows $(RUN_FLAGS)
 
 run-linux:
-	@echo "Running on Linux..."
-	flutter run -d linux
+	@echo "Running on Linux ($(RUN_MODE))..."
+	flutter run -d linux $(RUN_FLAGS)
 
 run-all:
 	@echo "Running on the desktop platform of this machine..."

@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_libserialport/flutter_libserialport.dart';
 
 class SerialService {
@@ -13,6 +13,10 @@ class SerialService {
 
   final _dataController = StreamController<String>.broadcast();
   Stream<String> get dataStream => _dataController.stream;
+
+  /// Test seam: publishes [data] on [dataStream] as if an adapter had sent it.
+  @visibleForTesting
+  void emitData(String data) => _dataController.add(data);
   
   bool get isConnected => _port != null && _port!.isOpen;
   
