@@ -2269,7 +2269,9 @@ class _HomeScreenState extends State<HomeScreen> {
               const SizedBox(height: 6),
               _guideText(theme,
                   'Now open Tftpd64 and select this adapter (192.168.1.2) as its '
-                  'server interface.'),
+                  'server interface. Keep Tftpd64 open until the router has '
+                  'loaded the image: the bootloader can only download it while '
+                  'Tftpd64 is running.'),
             ] else if (_os == HostOs.macos) ...[
               _guideText(theme,
                   'Replace en5 with your Ethernet interface. List the interfaces with:'),
@@ -2552,6 +2554,18 @@ class _HomeScreenState extends State<HomeScreen> {
             '(Default), Xmodem and others) and waits at "Select (enter for '
             'default):". Click Enter to choose TFTP client, or click the '
             '"0. TFTP Client" button in the console panel.'),
+        if (_isWindows) ...[
+          const SizedBox(height: 6),
+          _callout(
+            theme,
+            Icons.warning_amber_rounded,
+            'Tftpd64 must be open',
+            'Before continuing, make sure Tftpd64 is open, its server interface '
+                'is 192.168.1.2 and its folder holds the firmware (copied in '
+                '"Prepare your computer"). If it is closed, the download fails '
+                'with "Loading: T T T".',
+          ),
+        ],
       ]),
       _guideStep(theme, 4, 'Accept the network values and send the file name', [
         _guideText(theme,
@@ -2762,8 +2776,9 @@ class _HomeScreenState extends State<HomeScreen> {
             ...switch (_os) {
               HostOs.windows => [
                   _guideText(theme,
-                      'When Windows Defender Firewall asks, allow Tftpd64 and this app '
-                      'on private networks.'),
+                      'Make sure Tftpd64 is open, with 192.168.1.2 as its server '
+                      'interface. When Windows Defender Firewall asks, allow '
+                      'Tftpd64 and this app on private networks.'),
                 ],
               HostOs.macos => [
                   _guideText(theme,
