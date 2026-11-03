@@ -12,6 +12,12 @@ void main() {
         debugShowCheckedModeBanner: false,
       );
 
+  test('the backup file name is valid on Windows', () {
+    final name = HomeScreen.configBackupName(DateTime(2026, 11, 4, 9, 5, 7));
+    expect(name, 'openwrt-config-2026-11-04_09-05-07.tar.gz');
+    expect(name, isNot(matches(RegExp(r'[<>:/\\|?*"]'))));
+  });
+
   testWidgets('loads without touching the network', (tester) async {
     await tester.pumpWidget(app());
 

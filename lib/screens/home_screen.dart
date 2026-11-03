@@ -103,6 +103,16 @@ class HomeScreen extends StatefulWidget {
   /// Exposed so a test can assert the flash cannot be pressed while blocked.
   static const Key flashButtonKey = ValueKey('flash-firmware-button');
 
+  /// The suggested backup file name. It must not contain ":" or other
+  /// characters Windows forbids: file_picker's Windows save dialog then hangs
+  /// instead of opening.
+  @visibleForTesting
+  static String configBackupName(DateTime time) {
+    String two(int value) => value.toString().padLeft(2, '0');
+    return 'openwrt-config-${time.year}-${two(time.month)}-${two(time.day)}_'
+        '${two(time.hour)}-${two(time.minute)}-${two(time.second)}.tar.gz';
+  }
+
   /// Kept off in tests, where a real LAN probe would leave timers pending.
   final bool autoDiscover;
 
@@ -1472,8 +1482,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _showErrorToast(message);
         return;
       }
-      final suggested =
-          'openwrt-config-${DateTime.now().toIso8601String().substring(0, 19)}.tar.gz';
+      final suggested = HomeScreen.configBackupName(DateTime.now());
       final target = await FilePicker.platform.saveFile(
         dialogTitle: 'Where should the configuration backup be saved?',
         fileName: suggested,
