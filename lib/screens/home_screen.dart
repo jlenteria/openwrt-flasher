@@ -8,6 +8,7 @@ import 'package:file_picker/file_picker.dart';
 
 import '../models/console_tail.dart';
 import '../models/support_info.dart';
+import '../models/terminal_screen.dart';
 import '../models/firmware_info.dart';
 import '../models/router_info.dart';
 import '../services/firmware_download_service.dart';
@@ -60,9 +61,14 @@ class CheckRow {
 
 /// The console text plus the note shown when the tail window dropped output.
 /// A record type, so a flush that changes nothing does not notify listeners.
-typedef _ConsoleSnapshot = ({String text, String? droppedNote});
+typedef _ConsoleSnapshot = ({
+  String text,
+  List<HighlightRange> highlights,
+  String? droppedNote,
+});
 
-const _ConsoleSnapshot _emptyConsole = (text: '', droppedNote: null);
+const _ConsoleSnapshot _emptyConsole =
+    (text: '', highlights: [], droppedNote: null);
 
 /// Serial chunks are coalesced and republished at most this often. A boot log
 /// bursts 10-50 lines per second and still looks continuous at 8 Hz, while one
@@ -154,11 +160,12 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _upgradeDownloadStatus;
   bool _upgradeDownloadError = false;
   // Each OS's own TFTP server serves a different folder by default.
-  late String _tftpDir = switch (_os) {
-    HostOs.windows => r'C:\tftp',
-    HostOs.macos => '/private/tftpboot',
-    HostOs.linux => '/srv/tftp',
-  };
+  String get _defaultTftpDir => switch (_os) {
+        HostOs.windows => r'C:\tftp',
+        HostOs.macos => '/private/tftpboot',
+        HostOs.linux => '/srv/tftp',
+      };
+  late String _tftpDir = _defaultTftpDir;
   late final TextEditingController _tftpDirController =
       TextEditingController(text: _tftpDir);
   final TextEditingController _consoleInputController = TextEditingController();
@@ -281,13 +288,41 @@ class _HomeScreenState extends State<HomeScreen> {
     if (!mounted) return;
     _consoleTail.add(data);
     _consoleFlushTimer ??= Timer(_consoleFlushInterval, _flushConsoleWindow);
+    _acceptLoadAddressPrompt(data);
   }
+
+  /// The prompt "Load image" asks first. Its pre-filled address is always the
+  /// right one, so it is accepted for the user and one Enter on the menu entry
+  /// goes straight to the load methods.
+  static const String _loadAddressPrompt = 'Input load address:';
+
+  /// Short tail of the raw serial text, so a prompt split across two chunks is
+  /// still recognised.
+  String _promptScan = '';
+
+  void _acceptLoadAddressPrompt(String data) {
+    final text = _promptScan + data;
+    if (text.contains(_loadAddressPrompt)) {
+      _promptScan = '';
+      // Lets the bootloader print the pre-filled value and start reading.
+      Timer(_promptAnswerDelay, () {
+        if (mounted && _serialConnected) _sendSerial('\r');
+      });
+      return;
+    }
+    final keep = _loadAddressPrompt.length - 1;
+    _promptScan =
+        text.length > keep ? text.substring(text.length - keep) : text;
+  }
+
+  static const Duration _promptAnswerDelay = Duration(milliseconds: 200);
 
   void _flushConsoleWindow() {
     _consoleFlushTimer = null;
     if (!mounted || !_consoleTail.hasPending) return;
     _consoleSnapshot.value = (
       text: _consoleTail.flush(),
+      highlights: _consoleTail.highlights,
       droppedNote: _consoleTail.droppedBytes == 0
           ? null
           : 'Showing the last ${_formatBytes(_consoleTail.maxBytes)} of '
@@ -300,6 +335,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _consoleFlushTimer?.cancel();
     _consoleFlushTimer = null;
     _consoleTail.clear();
+    _promptScan = '';
     _consoleSnapshot.value = _emptyConsole;
   }
 
@@ -315,7 +351,13 @@ class _HomeScreenState extends State<HomeScreen> {
     final success = await _serialService.connect(_selectedSerialPort);
     // A new session must not read next to the previous port's log, and the
     // totals behind "of N KB" start over.
-    if (success) _resetConsoleWindow();
+    if (success) {
+      _resetConsoleWindow();
+      // Wakes a console that is already idle (OpenWrt's "Please press Enter
+      // to activate this console", or a prompt printed before connecting),
+      // so the user sees where the router is instead of an empty console.
+      _sendSerial('\r');
+    }
     _runOnUi(() {
       _serialConnected = success;
       _recoveryStatusIsError = !success;
@@ -1503,6 +1545,109 @@ class _HomeScreenState extends State<HomeScreen> {
     await _ssh.cancelUpload();
   }
 
+  /// Forgets the outcome of the last flash and the firmware it used, so the
+  /// Flash tab starts again from picking an image.
+  void _resetFlashResult() {
+    _verifiedAfter = null;
+    _flashError = null;
+    _installStarted = false;
+    _flashIssued = false;
+    _confirmationNote = null;
+    _skipConfirmation = false;
+    _confirming = false;
+    _confirmError = null;
+    _confirmIpController.clear();
+    _firmwarePath = null;
+    _firmware = null;
+    _ackUnverified = false;
+    _checks = [];
+    _preflightOk = false;
+    _backupFile = null;
+    _versionBefore = null;
+    _bootIdBefore = null;
+    _passwordController.clear();
+  }
+
+  /// Blocked while something is still writing a file, so a reset never leaves
+  /// a half-downloaded image or a half-applied restore behind.
+  bool get _canResetAll => !_downloadingDefault && !_restoring;
+
+  Future<void> _confirmResetAll() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => _dialog(
+        icon: const Icon(Icons.restart_alt),
+        title: const Text('Reset everything?'),
+        content: const Text(
+          'This clears the Flash and Recovery tabs: the router, firmware and '
+          'images you selected, the safety checks, the serial console and '
+          'every status message. The serial port is disconnected and the HTTP '
+          'server is stopped.\n\n'
+          'Nothing on the router changes, and downloaded files stay on disk.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Reset all'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) await _resetAll();
+  }
+
+  Future<void> _resetAll() async {
+    if (!_canResetAll) return;
+    await _ssh.disconnect();
+    if (_serialConnected) _serialService.disconnect();
+    if (_httpServerRunning) await _httpServerService.stop();
+    _resetConsoleWindow();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    _runOnUi(() {
+      // Flash tab
+      _resetFlashResult();
+      _usernameController.text = 'root';
+      _candidates = [];
+      _selectedIp = null;
+      _router = null;
+      _network = null;
+      _gateway = null;
+      _discoveryStatus = 'Not searched yet.';
+      _discoveryStatusIsError = false;
+      _keepSettings = false;
+      _backupConfig = true;
+      _restorePath = null;
+      _restoreProgress = 0;
+      _restoreStatus = null;
+      _restoreError = false;
+
+      // Recovery tab
+      _serialConnected = false;
+      _recoveryStatus = 'Not connected';
+      _recoveryStatusIsError = false;
+      _consoleInputController.clear();
+      _openwrtInitramfsPath = null;
+      _sysupgradeImagePath = null;
+      _initramfsDownloadStatus = null;
+      _initramfsDownloadError = false;
+      _upgradeDownloadStatus = null;
+      _upgradeDownloadError = false;
+      _tftpDir = _defaultTftpDir;
+      _tftpDirController.text = _tftpDir;
+      _httpServerRunning = false;
+      _httpServerUrl = null;
+      _httpServerMessage = null;
+      _httpServerError = false;
+    });
+    if (widget.autoDiscoverSerial) _refreshSerialPorts();
+    if (widget.autoDiscover) _probeGateways();
+  }
+
   Future<void> _leaveProgressScreen() async {
     _runOnUi(() {
       _flowAbandoned = true;
@@ -1536,6 +1681,11 @@ class _HomeScreenState extends State<HomeScreen> {
           title: const Text('OpenWrt Flasher'),
           backgroundColor: theme.colorScheme.primaryContainer,
           actions: [
+            IconButton(
+              onPressed: _canResetAll ? _confirmResetAll : null,
+              icon: const Icon(Icons.restart_alt),
+              tooltip: 'Reset all',
+            ),
             IconButton(
               onPressed: _showAbout,
               icon: const Icon(Icons.info_outline),
@@ -1948,6 +2098,20 @@ class _HomeScreenState extends State<HomeScreen> {
                 'Use 192.168.1.2: it is the TFTP server address U-Boot uses by '
                 'default, and step 6 downloads the image from it.'),
             const SizedBox(height: 6),
+            _callout(
+              theme,
+              Icons.wifi_off,
+              'Turn Wi-Fi off before setting the static IP',
+              'Home networks usually use the same 192.168.1.0/24 range as the '
+                  'router under recovery. With Wi-Fi still connected, both '
+                  'adapters answer on that range and replies to the router '
+                  '(TFTP and HTTP) leave over Wi-Fi instead of the Ethernet '
+                  'cable, so the transfer times out ("ARP Retry count '
+                  'exceeded" or "Loading: T T T"). Turn Wi-Fi off on your '
+                  '${_os.machine} now and keep it off until the firmware '
+                  'install finishes.',
+            ),
+            const SizedBox(height: 6),
             if (_isWindows) ...[
               _guideText(theme,
                   'Open Control Panel → Network and Sharing Center → Change adapter settings, '
@@ -2094,7 +2258,8 @@ class _HomeScreenState extends State<HomeScreen> {
               theme,
               Icons.lightbulb_outline,
               'Power LED must be ON',
-              'If the power light stays off, check the power adapter and the '
+              'If the power light stays off, check that the USB-to-TTL adapter '
+                  'is not plugged in yet, then the power adapter and the '
                   'outlet. Do not continue until the router is powered.',
               error: true,
             ),
@@ -2220,31 +2385,32 @@ class _HomeScreenState extends State<HomeScreen> {
       _guideStep(theme, 1, 'Stop the reboot', [
         _guideText(theme,
             'As soon as the bootloader starts counting down ("Hit any key to '
-            'stop autoboot"), send Enter or press any key in the console. This '
-            'stops the boot before the installed firmware starts.'),
-        const SizedBox(height: 6),
-        _guideText(theme,
-            'If the router has already finished booting, unplug its power '
-            'adapter and plug it back in while watching the console.'),
+            'stop autoboot"), click the UP or DOWN arrow button in the console. '
+            'This stops the countdown before the installed firmware starts. '
+            'Do not click Enter: it selects the highlighted "1. Startup '
+            'system" and boots the installed firmware.'),
         const SizedBox(height: 8),
         _guideText(theme, 'The bootloader menu should now appear:'),
         _guideCode(
           theme,
-          '1. Start default\n2. Upgrade firmware\n3. Upgrade bootloader\n'
-          '4. Load image\n5. U-Boot console',
+          '  *** U-Boot Boot Menu ***  Press UP/DOWN to move, ENTER to select\n'
+          '1. Startup system (Default)\n2. Upgrade firmware\n'
+          '3. Upgrade bootloader\n4. Load image\n0. U-Boot console',
           copyable: false,
         ),
       ]),
       _guideStep(theme, 2, 'Choose "Load image"', [
         _guideText(theme,
-            'Send 4 in the console, or click the "4. Load image" button in the '
-            'console panel.'),
+            'Click the DOWN arrow button until "4. Load image" is highlighted, '
+            'then click Enter. You can also click the "4. Load image" button '
+            'in the console panel.'),
       ]),
       _guideStep(theme, 3, 'Choose the TFTP client', [
         _guideText(theme,
-            'The transfer menu lists TFTP Client (Default), Xmodem and others. '
-            'Choose TFTP Client: press Enter or 1, or click the "1. Start '
-            'Default" button in the console panel.'),
+            'The console now lists the "Available load methods" (TFTP client '
+            '(Default), Xmodem and others) and waits at "Select (enter for '
+            'default):". Click Enter to choose TFTP client, or click the '
+            '"0. TFTP Client" button in the console panel.'),
       ]),
       _guideStep(theme, 4, 'Accept the network values and send the file name', [
         _guideText(theme,
@@ -2550,10 +2716,29 @@ class _HomeScreenState extends State<HomeScreen> {
               runSpacing: 8,
               children: [
                 Tooltip(
-                  message: 'Send Enter — stops autoboot and accepts prompts',
+                  message: 'Send Enter — selects the highlighted menu entry and '
+                      'accepts prompts',
                   child: OutlinedButton(
-                    onPressed: _serialConnected ? () => _sendSerial('\n') : null,
+                    // A carriage return, as a terminal sends for Enter: the
+                    // boot menu selects only on '\r' and ignores '\n'.
+                    onPressed: _serialConnected ? () => _sendSerial('\r') : null,
                     child: const Text('Enter'),
+                  ),
+                ),
+                Tooltip(
+                  message: 'Send Up arrow — moves the boot menu selection up',
+                  child: OutlinedButton(
+                    onPressed:
+                        _serialConnected ? () => _sendSerial('\x1b[A') : null,
+                    child: const Icon(Icons.arrow_upward, size: 18),
+                  ),
+                ),
+                Tooltip(
+                  message: 'Send Down arrow — moves the boot menu selection down',
+                  child: OutlinedButton(
+                    onPressed:
+                        _serialConnected ? () => _sendSerial('\x1b[B') : null,
+                    child: const Icon(Icons.arrow_downward, size: 18),
                   ),
                 ),
                 OutlinedButton(
@@ -2564,8 +2749,8 @@ class _HomeScreenState extends State<HomeScreen> {
                   message:
                       'Choose TFTP Client (the default) at the transfer menu',
                   child: OutlinedButton(
-                    onPressed: _serialConnected ? () => _sendSerial('1\n') : null,
-                    child: const Text('1. Start Default'),
+                    onPressed: _serialConnected ? () => _sendSerial('0\n') : null,
+                    child: const Text('0. TFTP Client'),
                   ),
                 ),
                 OutlinedButton(
@@ -2609,8 +2794,9 @@ class _HomeScreenState extends State<HomeScreen> {
         icon: const Icon(Icons.warning_amber_rounded),
         title: const Text('Reset the router configuration?'),
         content: const Text(
-          'This sends "reset" to the bootloader. It resets the saved '
-          'configuration and restarts the router with the defaults.',
+          'This sends Ctrl+C to leave any bootloader prompt, then "reset". '
+          'It resets the saved configuration and restarts the router with '
+          'the defaults.',
         ),
         actions: [
           TextButton(
@@ -2624,8 +2810,17 @@ class _HomeScreenState extends State<HomeScreen> {
         ],
       ),
     );
-    if (confirmed == true) _sendSerial('reset\n');
+    if (confirmed != true) return;
+    // Leave whatever prompt the bootloader is at first. A one-key prompt such
+    // as "Select (enter for default):" would otherwise take the 'r' and run
+    // the rest as the unknown command "eset".
+    _sendSerial('\x03');
+    await Future<void>.delayed(_promptExitDelay);
+    if (_serialConnected) _sendSerial('reset\n');
   }
+
+  /// Time for the bootloader to abort a prompt and print its command prompt.
+  static const Duration _promptExitDelay = Duration(milliseconds: 300);
 
   Future<void> _confirmSysupgrade() async {
     final confirmed = await showDialog<bool>(
@@ -3746,26 +3941,7 @@ class _HomeScreenState extends State<HomeScreen> {
               Center(
                 child: FilledButton(
                   onPressed: () {
-                    _runOnUi(() {
-                      _verifiedAfter = null;
-                      _flashError = null;
-                      _installStarted = false;
-                      _flashIssued = false;
-                      _confirmationNote = null;
-                      _skipConfirmation = false;
-                      _confirming = false;
-                      _confirmError = null;
-                      _confirmIpController.clear();
-                      _firmwarePath = null;
-                      _firmware = null;
-                      _ackUnverified = false;
-                      _checks = [];
-                      _preflightOk = false;
-                      _backupFile = null;
-                      _versionBefore = null;
-                      _bootIdBefore = null;
-                      _passwordController.clear();
-                    });
+                    _runOnUi(_resetFlashResult);
                     _probeGateways();
                   },
                   child: const Text('Start over'),
@@ -3898,6 +4074,23 @@ class _ConsoleOutputState extends State<_ConsoleOutput> {
     return position.pixels < position.maxScrollExtent - _consoleStickTolerance;
   }
 
+  /// Reverse video, as a terminal draws the selected bootloader menu entry.
+  static TextSpan _highlighted(String text, List<HighlightRange> highlights) {
+    const reverse = TextStyle(
+      color: Colors.black,
+      backgroundColor: Colors.greenAccent,
+    );
+    final children = <TextSpan>[];
+    var at = 0;
+    for (final (start, end) in highlights) {
+      if (start > at) children.add(TextSpan(text: text.substring(at, start)));
+      children.add(TextSpan(text: text.substring(start, end), style: reverse));
+      at = end;
+    }
+    if (at < text.length) children.add(TextSpan(text: text.substring(at)));
+    return TextSpan(children: children);
+  }
+
   void _followIfPinned() {
     if (!mounted || !_pinned || !widget.scrollController.hasClients) return;
     final position = widget.scrollController.position;
@@ -3936,10 +4129,17 @@ class _ConsoleOutputState extends State<_ConsoleOutput> {
               controller: widget.scrollController,
               child: SizedBox(
                 width: double.infinity,
-                child: SelectableText(
-                  snapshot.text.isEmpty ? _ConsoleOutput.placeholder : snapshot.text,
-                  style: _ConsoleOutput.textStyle,
-                ),
+                child: snapshot.highlights.isEmpty
+                    ? SelectableText(
+                        snapshot.text.isEmpty
+                            ? _ConsoleOutput.placeholder
+                            : snapshot.text,
+                        style: _ConsoleOutput.textStyle,
+                      )
+                    : SelectableText.rich(
+                        _highlighted(snapshot.text, snapshot.highlights),
+                        style: _ConsoleOutput.textStyle,
+                      ),
               ),
             ),
           ),

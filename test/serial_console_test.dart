@@ -7,11 +7,18 @@ import 'package:openwrt_flasher/services/serial_service.dart';
 /// Stands in for an adapter: the console path is exercised without a serial
 /// library to load or a board to talk to.
 class _FakeSerialService extends SerialService {
+  /// Everything the UI sent, so a quick-action button can be checked by the
+  /// bytes it puts on the wire rather than by its label.
+  final List<String> writes = [];
+
   @override
   List<String> getAvailablePorts() => const ['/dev/cu.fake0'];
 
   @override
   Future<bool> connect(String portName, {int baudRate = 115200}) async => true;
+
+  @override
+  void write(String data) => writes.add(data);
 
   @override
   void disconnect() {}
@@ -51,15 +58,18 @@ void main() {
     (widget) => widget is SingleChildScrollView && widget.controller != null,
   );
 
-  String consoleText(WidgetTester tester) =>
-      tester
-          .widget<SelectableText>(
-            find.descendant(
-              of: consoleView,
-              matching: find.byType(SelectableText),
-            ),
-          )
-          .data!;
+  SelectableText consoleWidget(WidgetTester tester) =>
+      tester.widget<SelectableText>(
+        find.descendant(
+          of: consoleView,
+          matching: find.byType(SelectableText),
+        ),
+      );
+
+  String consoleText(WidgetTester tester) {
+    final widget = consoleWidget(tester);
+    return widget.data ?? widget.textSpan!.toPlainText();
+  }
 
   ScrollPosition consolePosition(WidgetTester tester) =>
       tester.widget<SingleChildScrollView>(consoleView).controller!.position;
@@ -164,5 +174,147 @@ void main() {
 
     expect(consoleText(tester), startsWith('No output yet'));
     expect(find.textContaining('older output was dropped'), findsNothing);
+  });
+
+  testWidgets('a bootloader menu is drawn, not printed as escape codes',
+      (tester) async {
+    await openRecovery(tester, surface: const Size(1600, 1200));
+
+    await send(
+      tester,
+      'Hit any key to stop autoboot:  0 \r\n'
+      '\x1b[?25l\x1b[2J\x1b[1;1H\x1b[2K\x1b[2;1H  *** U-Boot Boot Menu ***'
+      '\x1b[0K\x1b[4;1H     \x1b[7m1. Startup system (Default)\x1b[0m'
+      '\x1b[5;1H     2. Upgrade firmware'
+      '\x1b[10;1H  Hit any key to stop autoboot:  3 '
+      '\x1b[10;1H\x1b[2K  Hit any key to stop autoboot:  2 ',
+    );
+    await tester.pump(flushInterval);
+
+    final text = consoleText(tester);
+    expect(text, isNot(contains('\x1b')));
+    expect(text, isNot(contains('[2J')));
+    expect(text, contains('\n     1. Startup system (Default)\n'));
+    expect(text, contains('autoboot:  2'));
+    expect(text, isNot(contains('autoboot:  3')));
+
+    final span = consoleWidget(tester).textSpan!;
+    final selected = span.children!
+        .cast<TextSpan>()
+        .firstWhere((child) => child.style?.backgroundColor != null);
+    expect(selected.text, '1. Startup system (Default)');
+  });
+
+  testWidgets('Reset all disconnects and clears the recovery session',
+      (tester) async {
+    await openRecovery(tester, surface: const Size(1600, 20000));
+    await tester.tap(find.text('Connect'));
+    await tester.pumpAndSettle();
+    serial.writes.clear();
+    await send(tester, 'U-Boot 2023.07\r\n');
+    await tester.pump(flushInterval);
+    expect(consoleText(tester), contains('U-Boot'));
+
+    await tester.tap(find.byTooltip('Reset all'));
+    await tester.pumpAndSettle();
+    // Asks first: nothing is cleared until confirmed.
+    expect(consoleText(tester), contains('U-Boot'));
+    await tester.tap(find.widgetWithText(FilledButton, 'Reset all'));
+    await tester.pumpAndSettle();
+
+    expect(consoleText(tester), startsWith('No output yet'));
+    expect(find.text('Connect'), findsOneWidget);
+    expect(find.text('Disconnect'), findsNothing);
+  });
+
+  testWidgets('arrows and Enter send what a terminal sends', (tester) async {
+    await openRecovery(tester, surface: const Size(1600, 20000));
+    await tester.tap(find.text('Connect'));
+    await tester.pumpAndSettle();
+    serial.writes.clear();
+
+    await tester.tap(find.byIcon(Icons.arrow_downward));
+    await tester.tap(find.byIcon(Icons.arrow_upward));
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Enter'));
+    await tester.pump();
+
+    expect(
+      serial.writes,
+      ['\x1b[B', '\x1b[A', '\r'],
+      reason: 'U-Boot\'s boot menu selects on a carriage return, not \\n',
+    );
+  });
+
+  testWidgets('Reset config leaves the current prompt before sending reset',
+      (tester) async {
+    await openRecovery(tester, surface: const Size(1600, 20000));
+    await tester.tap(find.text('Connect'));
+    await tester.pumpAndSettle();
+    serial.writes.clear();
+
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Reset config'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(FilledButton, 'Reset config'));
+    await tester.pump();
+    expect(serial.writes, ['\x03'],
+        reason: 'a one-key prompt must not swallow the "r" of reset');
+
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(serial.writes, ['\x03', 'reset\n']);
+  });
+
+  testWidgets('the load address prompt is accepted automatically',
+      (tester) async {
+    await openRecovery(tester, surface: const Size(1600, 20000));
+    await tester.tap(find.text('Connect'));
+    await tester.pumpAndSettle();
+    serial.writes.clear();
+
+    // Split across chunks, as a serial read may deliver it.
+    await send(tester, '*** Loading image ***\r\n\r\nInput load ');
+    await send(tester, 'address: 0x83000000');
+    expect(serial.writes, isEmpty);
+
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(serial.writes, ['\r']);
+
+    // Later output that is not the prompt is left alone.
+    await send(tester, '\r\n\r\nAvailable load methods:\r\n');
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(serial.writes, ['\r']);
+  });
+
+  testWidgets('Connect sends Enter to wake the console', (tester) async {
+    await openRecovery(tester, surface: const Size(1600, 20000));
+    await tester.tap(find.text('Connect'));
+    await tester.pumpAndSettle();
+
+    expect(serial.writes, ['\r']);
+  });
+
+  testWidgets('the quick actions send the numbers the guide names',
+      (tester) async {
+    // Tall enough that the whole guide is laid out next to the console panel,
+    // so the prose and the button it names can be compared.
+    await openRecovery(tester, surface: const Size(1600, 20000));
+    await tester.tap(find.text('Connect'));
+    await tester.pumpAndSettle();
+    serial.writes.clear();
+
+    await tester.tap(find.widgetWithText(OutlinedButton, '0. TFTP Client'));
+    await tester.tap(find.widgetWithText(OutlinedButton, '4. Load image'));
+    await tester.pump();
+
+    expect(
+      serial.writes,
+      ['0\n', '4\n'],
+      reason: 'TFTP Client is the menu\'s 0 entry, not 1',
+    );
+    expect(
+      find.textContaining('click the "0. TFTP Client" button'),
+      findsOneWidget,
+      reason: 'the guide names the button by its exact label, so renaming one '
+          'without the other fails here',
+    );
   });
 }
