@@ -18,6 +18,7 @@ import '../services/router_discovery_service.dart';
 import '../services/ssh_service.dart';
 import '../services/serial_service.dart';
 import '../services/http_server_service.dart';
+import '../services/tftp_folder_service.dart';
 
 /// The desktop OS the recovery guide is written for.
 enum HostOs {
@@ -159,15 +160,26 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _initramfsDownloadError = false;
   String? _upgradeDownloadStatus;
   bool _upgradeDownloadError = false;
-  // Each OS's own TFTP server serves a different folder by default.
+  // Each OS's own TFTP server serves a different folder by default. On
+  // Windows it is wherever Tftpd64 is installed, found in [_detectTftpd64].
   String get _defaultTftpDir => switch (_os) {
-        HostOs.windows => r'C:\tftp',
+        HostOs.windows => _tftpd64Dir ?? TftpFolderService.defaultTftpd64Dir,
         HostOs.macos => '/private/tftpboot',
         HostOs.linux => '/srv/tftp',
       };
+  String? _tftpd64Dir;
+  bool _tftpd64Detecting = false;
+  String? _tftpd64Status;
+
+  /// Set once the user types a folder, so detection never overwrites it.
+  bool _tftpDirEdited = false;
   late String _tftpDir = _defaultTftpDir;
   late final TextEditingController _tftpDirController =
       TextEditingController(text: _tftpDir);
+
+  /// Downloads land here, not in the TFTP folder: that folder is often
+  /// protected, so the user copies the files over in step 3.
+  String _downloadsDir = TftpFolderService.fallbackDownloadsDir;
   final TextEditingController _consoleInputController = TextEditingController();
   bool _httpServerRunning = false;
   String? _httpServerUrl;
@@ -242,6 +254,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _refreshSerialPorts();
     }
     _serialSub = _serialService.dataStream.listen(_onSerialData);
+    _detectTftpd64();
     if (widget.autoDiscover) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _probeGateways());
     }
@@ -406,8 +419,8 @@ class _HomeScreenState extends State<HomeScreen> {
     final file = File('$_tftpDir${Platform.pathSeparator}$name');
     if (!await file.exists()) {
       final message =
-          '$_tftpDir does not contain $name yet. Download the default firmware '
-          'in step 1 or press Copy Files first.';
+          '$_tftpDir does not contain $name yet. Copy it there from '
+          '$_downloadsDir (step 3) first.';
       _runOnUi(() {
         _recoveryStatus = message;
         _recoveryStatusIsError = true;
@@ -446,11 +459,13 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _downloadDefaultImage(DefaultFirmwareImage image) async {
     if (_downloadingDefault) return;
-    final directory = _tftpDir;
     _setDownloadStatus(image, 'Downloading ${image.label}...');
     _runOnUi(() => _downloadingDefault = true);
     var lastPercent = -1;
+    var directory = _downloadsDir;
     try {
+      directory = await TftpFolderService.downloadsDir();
+      _runOnUi(() => _downloadsDir = directory);
       final file = await _firmwareDownloads.downloadDefaultImage(
         image,
         directory,
@@ -468,7 +483,7 @@ class _HomeScreenState extends State<HomeScreen> {
       );
       final role = image.isUpgrade ? 'upgrade' : 'default';
       final message = 'Saved ${_basename(file.path)} to $directory and selected '
-          'it as the $role firmware.';
+          'it as the $role firmware. Copy it to the TFTP folder in step 3.';
       _runOnUi(() {
         if (image.isUpgrade) {
           _sysupgradeImagePath = file.path;
@@ -485,9 +500,7 @@ class _HomeScreenState extends State<HomeScreen> {
     } catch (e) {
       _setDownloadStatus(image, 'Download failed: $e', error: true);
       _showErrorToast(
-        'Could not download the ${image.label} firmware: $e If $directory is '
-        'not writable, run the command in step 1 first or pick another folder '
-        'in step 3.',
+        'Could not download the ${image.label} firmware to $directory: $e',
       );
     } finally {
       _runOnUi(() => _downloadingDefault = false);
@@ -532,12 +545,66 @@ class _HomeScreenState extends State<HomeScreen> {
         _recoveryStatusIsError = false;
       });
     } catch (e) {
+      final hint = switch (_os) {
+        HostOs.windows => ' The Tftpd64 folder usually needs administrator '
+            'rights: open both folders and copy the files in File Explorer.',
+        HostOs.macos => ' Run the chmod command in step 1, or copy the files '
+            'with the command in step 3.',
+        HostOs.linux => ' Run the chown command in step 1, or copy the files '
+            'with the command in step 3.',
+      };
       _runOnUi(() {
         _recoveryStatus = 'Could not copy the files to $_tftpDir: $e';
         _recoveryStatusIsError = true;
       });
-      _showErrorToast('Could not copy the files to $_tftpDir: $e');
+      _showErrorToast('Could not copy the files to $_tftpDir: $e$hint');
     }
+  }
+
+  /// Points the firmware folder at the folder Tftpd64 serves, wherever it was
+  /// installed. Only runs on Windows, the only OS whose guide uses Tftpd64.
+  Future<void> _detectTftpd64() async {
+    if (!_isWindows || !Platform.isWindows || _tftpd64Detecting) return;
+    _runOnUi(() => _tftpd64Detecting = true);
+    final location = await TftpFolderService.findTftpd64();
+    _runOnUi(() {
+      _tftpd64Detecting = false;
+      if (location == null) {
+        _tftpd64Status = 'Tftpd64 was not found. Install it (step 1), then '
+            'press Detect, or type the folder Tftpd64 serves.';
+        return;
+      }
+      _tftpd64Dir = location.baseDir;
+      _tftpd64Status = 'Found Tftpd64 in ${location.installDir}.';
+      if (!_tftpDirEdited) {
+        _tftpDir = location.baseDir;
+        _tftpDirController.text = _tftpDir;
+      }
+    });
+  }
+
+  Future<void> _openFolder(String directory) async {
+    try {
+      if (!await Directory(directory).exists()) {
+        _showErrorToast('$directory does not exist yet.');
+        return;
+      }
+      await TftpFolderService.openFolder(directory);
+    } catch (e) {
+      _showErrorToast('Could not open $directory: $e');
+    }
+  }
+
+  /// The command that copies the downloaded files into the TFTP folder.
+  String get _copyCommand {
+    final paths = [?_openwrtInitramfsPath, ?_sysupgradeImagePath];
+    if (paths.isEmpty) {
+      paths.addAll(FirmwareDownloadService.defaultImages
+          .map((image) => '$_downloadsDir/${image.fileName}'));
+    }
+    final sources = paths.map((path) => '"$path"').join(' ');
+    final sudo = _os == HostOs.macos ? 'sudo ' : '';
+    return '${sudo}cp $sources "$_tftpDir/"';
   }
 
   Future<void> _startHttpServer() async {
@@ -1637,6 +1704,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _initramfsDownloadError = false;
       _upgradeDownloadStatus = null;
       _upgradeDownloadError = false;
+      _tftpDirEdited = false;
       _tftpDir = _defaultTftpDir;
       _tftpDirController.text = _tftpDir;
       _httpServerRunning = false;
@@ -1953,10 +2021,12 @@ class _HomeScreenState extends State<HomeScreen> {
                 'FT232, etc.) if Windows does not recognize it automatically.'),
             const SizedBox(height: 6),
             _guideText(theme,
-                'Install a TFTP server such as Tftpd64 and set its base directory to '
-                'the firmware folder below. Once the Ethernet adapter has the '
-                'static IP in step 5, select it (192.168.1.2) as the server '
-                'interface. The bootloader downloads the initramfs image from it.'),
+                'Install the Tftpd64 TFTP server. It serves the folder it is '
+                'installed in (keep its base directory set to "."), and this app '
+                'finds that folder automatically in step 3. Once the Ethernet '
+                'adapter has the static IP in step 5, select it (192.168.1.2) as '
+                'the server interface. The bootloader downloads the initramfs '
+                'image from it.'),
             _guideCode(theme, 'https://pjo2.github.io/tftpd64/'),
             _guideText(theme,
                 'Nothing else is needed: this app includes the serial console '
@@ -1965,7 +2035,8 @@ class _HomeScreenState extends State<HomeScreen> {
         HostOs.macos => _guideStep(theme, 1, 'Enable the TFTP Server', [
             _guideText(theme,
                 'macOS has a built-in TFTP server that serves /private/tftpboot. '
-                'Start it and let this app copy files into the folder:'),
+                'Start it and make the folder writable, so the firmware can be '
+                'copied into it in step 3:'),
             _guideCode(theme,
                 'sudo launchctl load -F /System/Library/LaunchDaemons/tftp.plist\n'
                 'sudo chmod 777 /private/tftpboot'),
@@ -1989,8 +2060,8 @@ class _HomeScreenState extends State<HomeScreen> {
         _guideLabel(theme, 'Default Firmware (initramfs)'),
         _guideText(theme,
             'If you have not downloaded firmware yet, use the default. It is '
-            'saved to the firmware folder and selected as the initramfs image, '
-            'ready for the TFTP boot below.'),
+            'saved to your Downloads folder and selected as the initramfs image; '
+            'step 3 copies it to the TFTP folder.'),
         const SizedBox(height: 4),
         for (final image in FirmwareDownloadService.defaultFirmwareImages) ...[
           _defaultFirmwareRow(theme, image),
@@ -2048,33 +2119,103 @@ class _HomeScreenState extends State<HomeScreen> {
           _pickSysupgradeImage,
         ),
       ]),
-      _guideStep(theme, 3, _isWindows ? 'Create a Firmware Folder' : 'Copy Firmware Files', [
+      _guideStep(
+          theme,
+          3,
+          _isWindows
+              ? 'Copy Firmware to the Tftpd64 Folder'
+              : 'Copy Firmware to the TFTP Folder',
+          [
         _guideText(theme,
-            'Copy all downloaded firmware files to the folder your TFTP server '
-            'serves:'),
+            'Downloaded firmware is saved to your Downloads folder:'),
+        const SizedBox(height: 4),
+        Row(
+          children: [
+            Expanded(child: _guideCode(theme, _downloadsDir)),
+            const SizedBox(width: 8),
+            OutlinedButton.icon(
+              onPressed: () => _openFolder(_downloadsDir),
+              icon: const Icon(Icons.folder_open),
+              label: const Text('Open'),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        _guideText(
+            theme,
+            switch (_os) {
+              HostOs.windows =>
+                'You must copy those files into the folder Tftpd64 serves. It '
+                    'is found from where Tftpd64 is installed; press Detect after '
+                    'installing it, or type the folder if you changed it:',
+              HostOs.macos =>
+                'You must copy those files into /private/tftpboot, the folder '
+                    'the macOS TFTP server serves:',
+              HostOs.linux =>
+                'You must copy those files into the folder your TFTP server '
+                    'serves:',
+            }),
         const SizedBox(height: 4),
         Row(
           children: [
             Expanded(
               child: TextField(
                 controller: _tftpDirController,
-                decoration: const InputDecoration(
-                  labelText: 'Firmware folder',
-                  border: OutlineInputBorder(),
+                decoration: InputDecoration(
+                  labelText:
+                      _isWindows ? 'Tftpd64 folder' : 'TFTP folder',
+                  border: const OutlineInputBorder(),
                   isDense: true,
                 ),
-                onChanged: (value) => _runOnUi(() => _tftpDir = value),
+                onChanged: (value) => _runOnUi(() {
+                  _tftpDir = value;
+                  _tftpDirEdited = true;
+                }),
               ),
             ),
+            if (_isWindows) ...[
+              const SizedBox(width: 8),
+              OutlinedButton.icon(
+                onPressed: _tftpd64Detecting
+                    ? null
+                    : () {
+                        _tftpDirEdited = false;
+                        _detectTftpd64();
+                      },
+                icon: const Icon(Icons.search),
+                label: const Text('Detect'),
+              ),
+            ],
             const SizedBox(width: 8),
-            FilledButton.tonalIcon(
-              onPressed: _openwrtInitramfsPath == null && _sysupgradeImagePath == null
-                  ? null
-                  : _copyToTftp,
-              icon: const Icon(Icons.copy),
-              label: const Text('Copy Files'),
+            OutlinedButton.icon(
+              onPressed: () => _openFolder(_tftpDir),
+              icon: const Icon(Icons.folder_open),
+              label: const Text('Open'),
             ),
           ],
+        ),
+        if (_isWindows && _tftpd64Status != null) ...[
+          const SizedBox(height: 4),
+          _inlineStatus(theme, _tftpd64Status!, error: _tftpd64Dir == null),
+        ],
+        const SizedBox(height: 8),
+        if (_isWindows)
+          _guideText(theme,
+              'Tftpd64 is usually installed under Program Files, which needs '
+              'administrator rights. Open both folders and copy the files in '
+              'File Explorer (accept the administrator prompt), or try Copy '
+              'Files:')
+        else ...[
+          _guideText(theme, 'Copy them from a terminal, or try Copy Files:'),
+          _guideCode(theme, _copyCommand),
+        ],
+        const SizedBox(height: 4),
+        FilledButton.tonalIcon(
+          onPressed: _openwrtInitramfsPath == null && _sysupgradeImagePath == null
+              ? null
+              : _copyToTftp,
+          icon: const Icon(Icons.copy),
+          label: const Text('Copy Files'),
         ),
       ]),
     ];
