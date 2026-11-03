@@ -53,7 +53,7 @@ class FirmwareDownloadService {
       role: FirmwareRole.upgradeFirmware,
       label: 'FlareWifi',
       details: 'Example upgrade image; verify it matches this board before installing',
-      fileId: '1qFELcvKvQ1JpzjsqxVIzVdHrpfT9sgqQ',
+      fileId: '1wCbX0BCN1anz6ai6E361IJxRppNoDn6B',
       fileName: 'flarewifi-firmware.bin',
     ),
   ];
