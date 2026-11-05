@@ -51,7 +51,8 @@ class RouterDiscoveryService {
   static const gatewayProbeTimeout = Duration(seconds: 2);
   static const defaultPrefixLength = 24;
 
-  /// Determines the IPv4 address of the wired LAN interface the router is on.
+  /// Determines the IPv4 address of the wired LAN interface the router is on:
+  /// the last wired interface the OS lists.
   ///
   /// Wi-Fi is deliberately not consulted. The router is expected on an Ethernet
   /// cable, and the Wi-Fi address usually belongs to a different subnet and a
@@ -68,9 +69,11 @@ class RouterDiscoveryService {
 
     final physical = candidates.where((c) => !_isVirtual(c.name)).toList();
     final wired = physical.where((c) => !wireless(c.name)).toList();
+    // The last LAN is the router's: on Windows the built-in Ethernet is
+    // listed first and the cable to the router (often a USB adapter) after it.
     final chosen = wired.isNotEmpty
-        ? wired.first
-        : (physical.isNotEmpty ? physical.first : candidates.first);
+        ? wired.last
+        : (physical.isNotEmpty ? physical.last : candidates.last);
     final onWifi = wireless(chosen.name);
     return LocalNetwork(
       localIp: chosen.ip,

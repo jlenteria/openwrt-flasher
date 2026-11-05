@@ -161,7 +161,7 @@ void main() {
     }
   });
 
-  testWidgets('erases the configuration unless the user opts in',
+  testWidgets('keeps the configuration and skips the backup by default',
       (tester) async {
     await tester.pumpWidget(app());
 
@@ -178,8 +178,8 @@ void main() {
 
     expect(
       tester.widget<SwitchListTile>(keepTile).value,
-      isFalse,
-      reason: 'sysupgrade must run with -n by default',
+      isTrue,
+      reason: 'sysupgrade must run without -n by default',
     );
 
     final backupTile = find.widgetWithText(
@@ -187,12 +187,8 @@ void main() {
       'Download a configuration backup first',
     );
     final backup = tester.widget<SwitchListTile>(backupTile);
-    expect(backup.value, isTrue);
-    expect(
-      backup.onChanged,
-      isNotNull,
-      reason: 'the backup is most useful when settings are erased',
-    );
+    expect(backup.value, isFalse);
+    expect(backup.onChanged, isNotNull);
   });
 
   testWidgets('advertises no drag-and-drop that is not implemented',

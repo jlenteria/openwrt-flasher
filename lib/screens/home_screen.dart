@@ -210,8 +210,8 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _ackUnverified = false;
   bool _firmwareBusy = false;
 
-  bool _keepSettings = false;
-  bool _backupConfig = true;
+  bool _keepSettings = true;
+  bool _backupConfig = false;
 
   List<CheckRow> _checks = [];
   bool _preflightOk = false;
@@ -543,9 +543,15 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!await dir.exists()) {
         await dir.create(recursive: true);
       }
-      for (final path in [_openwrtInitramfsPath, _sysupgradeImagePath]) {
+      // Copied under the fixed names the router asks for, whatever the
+      // chosen files are called.
+      final sources = {
+        _initramfsName: _openwrtInitramfsPath,
+        _firmwareName: _sysupgradeImagePath,
+      };
+      for (final MapEntry(key: name, value: path) in sources.entries) {
         if (path == null) continue;
-        final target = '$_tftpDir${Platform.pathSeparator}${_basename(path)}';
+        final target = '$_tftpDir${Platform.pathSeparator}$name';
         // A default download already lives in this folder.
         if (File(path).absolute.path == File(target).absolute.path) continue;
         await File(path).copy(target);
@@ -606,15 +612,23 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   /// The command that copies the downloaded files into the TFTP folder.
+  /// Each file is copied under the fixed name the router asks for.
   String get _copyCommand {
-    final paths = [?_openwrtInitramfsPath, ?_sysupgradeImagePath];
-    if (paths.isEmpty) {
-      paths.addAll(FirmwareDownloadService.defaultImages
-          .map((image) => '$_downloadsDir/${image.fileName}'));
-    }
-    final sources = paths.map((path) => '"$path"').join(' ');
+    final noneSelected =
+        _openwrtInitramfsPath == null && _sysupgradeImagePath == null;
+    final pairs = {
+      _initramfsName: noneSelected
+          ? '$_downloadsDir/$_initramfsName'
+          : _openwrtInitramfsPath,
+      _firmwareName: noneSelected
+          ? '$_downloadsDir/$_firmwareName'
+          : _sysupgradeImagePath,
+    };
     final sudo = _os == HostOs.macos ? 'sudo ' : '';
-    return '${sudo}cp $sources "$_tftpDir/"';
+    return [
+      for (final MapEntry(key: name, value: path) in pairs.entries)
+        if (path != null) '${sudo}cp "$path" "$_tftpDir/$name"',
+    ].join('\n');
   }
 
   Future<void> _startHttpServer() async {
@@ -1695,8 +1709,8 @@ class _HomeScreenState extends State<HomeScreen> {
       _gateway = null;
       _discoveryStatus = 'Not searched yet.';
       _discoveryStatusIsError = false;
-      _keepSettings = false;
-      _backupConfig = true;
+      _keepSettings = true;
+      _backupConfig = false;
       _restorePath = null;
       _restoreProgress = 0;
       _restoreStatus = null;
@@ -1879,15 +1893,13 @@ class _HomeScreenState extends State<HomeScreen> {
 
   String _basename(String path) => path.split(RegExp(r'[\\/]')).last;
 
-  String get _firmwareName => _sysupgradeImagePath == null
-      ? 'openwrt-sysupgrade.bin'
-      : _basename(_sysupgradeImagePath!);
+  /// The name OpenWrt downloads and installs. Fixed, so the console commands
+  /// never depend on what the chosen upgrade file is called.
+  String get _firmwareName => FirmwareDownloadService.upgradeFirmwareFileName;
 
-  /// The name U-Boot must ask the TFTP server for. Falls back to the built-in
-  /// default image, so the name is known before anything is downloaded.
-  String get _initramfsName => _openwrtInitramfsPath == null
-      ? FirmwareDownloadService.defaultFirmwareImages.first.fileName
-      : _basename(_openwrtInitramfsPath!);
+  /// The name U-Boot asks the TFTP server for. Fixed, so it is known before
+  /// anything is downloaded and matches the copy in the TFTP folder.
+  String get _initramfsName => FirmwareDownloadService.defaultFirmwareFileName;
 
   String get _serverBase => _httpServerUrl ?? 'http://192.168.1.2:8080';
 
@@ -2212,8 +2224,8 @@ class _HomeScreenState extends State<HomeScreen> {
           _guideText(theme,
               'Tftpd64 is usually installed under Program Files, which needs '
               'administrator rights. Open both folders and copy the files in '
-              'File Explorer (accept the administrator prompt), or try Copy '
-              'Files:')
+              'File Explorer (accept the administrator prompt), naming them '
+              '$_initramfsName and $_firmwareName, or try Copy Files:')
         else ...[
           _guideText(theme, 'Copy them from a terminal, or try Copy Files:'),
           _guideCode(theme, _copyCommand),
@@ -3909,6 +3921,8 @@ class _HomeScreenState extends State<HomeScreen> {
                 const SizedBox(height: 24),
                 ...FlashStep.values
                     .where((step) => step != FlashStep.idle)
+                    // A skipped backup is not a step the flash goes through.
+                    .where((step) => step != FlashStep.backup || _backupConfig)
                     .map((step) {
                   final currentIndex = FlashStep.values.indexOf(_step);
                   final stepIndex = FlashStep.values.indexOf(step);

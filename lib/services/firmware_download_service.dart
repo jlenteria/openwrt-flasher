@@ -41,20 +41,25 @@ class FirmwareDownloadException implements Exception {
 }
 
 class FirmwareDownloadService {
+  /// The names the router asks for: U-Boot's TFTP prompt and the OpenWrt
+  /// wget/sysupgrade commands always use these, whatever file was chosen.
+  static const defaultFirmwareFileName = 'default-firmware.bin';
+  static const upgradeFirmwareFileName = 'flarewifi-firmware.bin';
+
   static const defaultImages = [
     DefaultFirmwareImage(
       role: FirmwareRole.defaultFirmware,
       label: 'ZR-2660',
       details: 'Initramfs image for the ZR-2660 board',
       fileId: '1ku6Hk5ivIF9N0-1fua4DaQcfKOsYFPM5',
-      fileName: 'default-firmware.bin',
+      fileName: defaultFirmwareFileName,
     ),
     DefaultFirmwareImage(
       role: FirmwareRole.upgradeFirmware,
       label: 'FlareWifi',
       details: 'Example upgrade image; verify it matches this board before installing',
       fileId: '1wCbX0BCN1anz6ai6E361IJxRppNoDn6B',
-      fileName: 'flarewifi-firmware.bin',
+      fileName: upgradeFirmwareFileName,
     ),
   ];
 
