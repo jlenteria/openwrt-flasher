@@ -9,8 +9,8 @@ void main() {
     expect(
       images.map((image) => image.fileId),
       containsAll([
-        '1ku6Hk5ivIF9N0-1fua4DaQcfKOsYFPM5',
-        '1wCbX0BCN1anz6ai6E361IJxRppNoDn6B',
+        '12nwfNR5ZmrzSdl2QF7Y-b3p-OhFLwh9v',
+        '1x4eSR8brKXuIbq2PhQedC4FfU_9jUv1E',
       ]),
     );
 

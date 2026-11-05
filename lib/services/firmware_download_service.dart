@@ -51,14 +51,14 @@ class FirmwareDownloadService {
       role: FirmwareRole.defaultFirmware,
       label: 'ZR-2660',
       details: 'Initramfs image for the ZR-2660 board',
-      fileId: '1ku6Hk5ivIF9N0-1fua4DaQcfKOsYFPM5',
+      fileId: '12nwfNR5ZmrzSdl2QF7Y-b3p-OhFLwh9v',
       fileName: defaultFirmwareFileName,
     ),
     DefaultFirmwareImage(
       role: FirmwareRole.upgradeFirmware,
       label: 'FlareWifi',
       details: 'Example upgrade image; verify it matches this board before installing',
-      fileId: '1wCbX0BCN1anz6ai6E361IJxRppNoDn6B',
+      fileId: '1x4eSR8brKXuIbq2PhQedC4FfU_9jUv1E',
       fileName: upgradeFirmwareFileName,
     ),
   ];
